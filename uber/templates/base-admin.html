@@ -3,10 +3,13 @@
 {% block top_of_body_additional %}
     <div id="floating_logo">
         <img src="../static/theme/bg-logo.png" />
+        {% if c.DEV_BOX %}
+        <img style="z-index:-1;position:fixed;bottom:0;right:0;" src="//robohash.org/fc63b646a859f555051b20c55187302d">
+        {% endif %}
     </div>
     {% if c.DEV_BOX %}
     <div id="devbox_cautiontape"></div>
-    <div id="devbox_text">DEVELOPMENT</div>
+    <div id="devbox_text" style="display: block;unicode-bidi: embed;font-family: monospace;white-space: pre;">Dev Build | panels 47b040f panel_voting CLEAN | uber 95c9411 master CLEAN |</div>
     {% endif %}
 {%  endblock %}
 
