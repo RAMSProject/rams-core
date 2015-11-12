@@ -267,7 +267,7 @@ class SecretConfig(_Overridable):
         support reading the DB connection info from an environment var (used with Docker containers)
         DB_CONNECTION_STRING should contain the full Postgres URI
         """
-        db_connection_string = os.environ.get('DB_CONNECTION_STRING')
+        db_connection_string = os.environ.get('CONNECTION_STRING')
 
         if db_connection_string is not None:
             return db_connection_string
