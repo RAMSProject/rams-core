@@ -129,7 +129,11 @@
         var setKickinFromBadge = function (types, index) {
             var type = types.options[index];
             if (type.extra !== undefined && type.extra !== null && $.field('amount_extra')) {
-                $('input:radio[name=amount_extra][value='+ type.extra +']').prop('checked', true).trigger('change');
+                {% if c.DONATION_SLIDER_DISPLAY %}
+                    $('input:radio[name=amount_extra][value='+ type.extra +']').prop('checked', true).trigger('change');
+                {% else %}
+                    $.field('amount_extra').val(type.extra).trigger('change');
+                {% endif %}
             }
         };
         var makeBadgeMatchExtra = function () {
@@ -163,7 +167,9 @@
                     });
                     $(types.row).append('<div style="clear:both">&nbsp;</div>');
                 });
-                setBadge(REG_TYPES, $.field('name') && $.val('name') ? 1 : 0);  // default to attendee or group
+                if (window.REG_TYPES && $(REG_TYPES.row).size()) {
+                    setBadge(REG_TYPES, $.field('name') && $.val('name') ? 1 : 0);  // default to attendee or group
+                }
                 makeBadgeMatchExtra();
                 if ($.field('amount_extra')) {
                     {% if not c.DONATION_SLIDER_DISPLAY %}

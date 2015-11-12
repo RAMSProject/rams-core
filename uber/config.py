@@ -65,8 +65,7 @@ class _Overridable:
                     val = name
             else:
                 varnames.append(name.upper())
-                val = int(sha512(name.upper().encode()).hexdigest()[:7], 16)
-                setattr(self, name.upper(),  val)
+                val = self.create_enum_val(name)
 
             if desc:
                 opts.append((val, desc))
@@ -76,6 +75,11 @@ class _Overridable:
         setattr(self, enum_name + '_OPTS', opts)
         setattr(self, enum_name + '_VARS', varnames)
         setattr(self, enum_name + ('' if enum_name.endswith('S') else 'S'), lookup)
+
+    def create_enum_val(self, name):
+        val = int(sha512(name.upper().encode()).hexdigest()[:7], 16)
+        setattr(self, name.upper(), val)
+        return val
 
 
 class Config(_Overridable):
@@ -312,6 +316,19 @@ def _is_intstr(s):
         return s[1:].isdigit()
     return s.isdigit()
 
+'''
+Under certain conditions, we want to completely remove certain payment options from the system.
+However, doing so cleanly also risks an exception being raised if these options are referenced elsewhere in the code
+(i.e., c.STRIPE). So we create an enum val to allow code to check for these variables without exceptions.
+'''
+if not c.KIOSK_CC_ENABLED:
+    del _config['enums']['door_payment_method']['stripe']
+    c.create_enum_val('stripe')
+
+if not c.GROUPS_ENABLED:
+    del _config['enums']['door_payment_method']['group']
+    c.create_enum_val('group')
+
 c.make_enums(_config['enums'])
 
 for _name, _val in _config['integer_enums'].items():
@@ -343,6 +360,8 @@ for _name, _section in _config['age_groups'].items():
 
 c.TABLE_PRICES = defaultdict(lambda: _config['table_prices']['default_price'],
                              {int(k): v for k, v in _config['table_prices'].items() if k != 'default_price'})
+c.PREREG_TABLE_OPTS = list(range(1, c.MAX_TABLES + 1))
+c.ADMIN_TABLE_OPTS = list(range(0, 9))
 
 c.SHIFTLESS_DEPTS = {getattr(c, dept.upper()) for dept in c.SHIFTLESS_DEPTS}
 c.PREASSIGNED_BADGE_TYPES = [getattr(c, badge_type.upper()) for badge_type in c.PREASSIGNED_BADGE_TYPES]

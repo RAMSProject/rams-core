@@ -8,32 +8,6 @@ def to_sessionized(attendee, group):
         return Charge.to_sessionized(attendee)
 
 
-def check_prereg_reqs(attendee):
-    if attendee.badge_type == c.PSEUDO_DEALER_BADGE and not attendee.cellphone:
-        return 'Your phone number is required'
-    elif attendee.amount_extra >= c.SHIRT_LEVEL and attendee.shirt == c.NO_SHIRT:
-        return 'Your shirt size is required'
-
-
-def check_dealer(group):
-    if not group.wares:
-        return 'You must provide a detailed explanation of what you sell for us to evaluate your submission'
-    elif not group.website:
-        return "Please enter your business' website address"
-    elif not group.description:
-        return 'Please provide a brief description of your business'
-    elif not group.address:
-        return 'Please provide your full address for tax purposes'
-
-
-def send_banned_email(attendee):
-    try:
-        send_email(c.REGDESK_EMAIL, c.REGDESK_EMAIL, 'Banned attendee registration',
-                   render('emails/reg_workflow/banned_attendee.txt', {'attendee': attendee}), model='n/a')
-    except:
-        log.error('unable to send banned email about {}', attendee)
-
-
 def check_post_con(klass):
     def wrapper(func):
         @wraps(func)
@@ -44,7 +18,7 @@ def check_post_con(klass):
                     <h2 style='color:red'>Hope you had a great {event}!</h2>
                     Preregistration for {event} {year} will open in a few months.
                 </body></html>
-                """.format(event=EVENT_NAME, year=(1 + int(YEAR)) if YEAR else '')
+                """.format(event=c.EVENT_NAME, year=(1 + int(c.YEAR)) if c.YEAR else '')
             else:
                 return func(self, *args, **kwargs)
         return wrapped
@@ -101,7 +75,7 @@ class Root:
         raise HTTPRedirect('../registration/register')
 
     def check_prereg(self):
-        return json.dumps({'force_refresh': c.AFTER_PREREG_TAKEDOWN or c.BADGES_SOLD >= c.MAX_BADGE_SALES})
+        return json.dumps({'force_refresh': not c.AT_THE_CON and (c.AFTER_PREREG_TAKEDOWN or c.BADGES_SOLD >= c.MAX_BADGE_SALES)})
 
     def check_if_preregistered(self, session, message="", **params):
         if 'email' in params:
@@ -158,11 +132,9 @@ class Root:
             return render('static_views/dealer_reg_closed.html') if c.AFTER_DEALER_REG_SHUTDOWN else render('static_views/dealer_reg_not_open.html')
 
         if 'first_name' in params:
-            message = check(attendee) or check_prereg_reqs(attendee)
+            message = check(attendee, prereg=True)
             if not message and attendee.badge_type in [c.PSEUDO_DEALER_BADGE, c.PSEUDO_GROUP_BADGE]:
-                message = check(group)
-                if attendee.badge_type == c.PSEUDO_DEALER_BADGE:
-                    message = check_dealer(group)
+                message = check(group, prereg=True)
 
             if not message:
                 if attendee.badge_type in [c.PSEUDO_DEALER_BADGE, c.PSEUDO_GROUP_BADGE]:
@@ -191,10 +163,10 @@ class Root:
                     if group.badges:
                         Tracking.track(track_type, group)
 
-                if session.query(Attendee).filter_by(first_name=attendee.first_name, last_name=attendee.last_name, email=attendee.email).count():
+                if session.valid_attendees().filter_by(first_name=attendee.first_name, last_name=attendee.last_name, email=attendee.email).count():
                     raise HTTPRedirect('duplicate?id={}', group.id if attendee.paid == c.PAID_BY_GROUP else attendee.id)
 
-                if attendee.full_name in c.BANNED_ATTENDEES:
+                if attendee.banned:
                     raise HTTPRedirect('banned?id={}', group.id if attendee.paid == c.PAID_BY_GROUP else attendee.id)
 
                 raise HTTPRedirect('index')
@@ -245,8 +217,6 @@ class Root:
             attendee.paid = c.HAS_PAID
             attendee.amount_paid = attendee.total_cost
             session.add(attendee)
-            if attendee.full_name in c.BANNED_ATTENDEES:
-                send_banned_email(attendee)
 
         for group in charge.groups:
             group.amount_paid = group.default_cost - group.amount_extra
@@ -254,9 +224,6 @@ class Root:
                 if attendee.amount_extra:
                     attendee.amount_paid = attendee.total_cost
             session.add(group)
-            session.commit()  # commit now so group.leader will resolve
-            if group.leader.full_name in c.BANNED_ATTENDEES:
-                send_banned_email(group.leader)
 
         self.unpaid_preregs.clear()
         self.paid_preregs.extend(charge.targets)
@@ -297,15 +264,12 @@ class Root:
         group = session.group(group_id)
         attendee = session.attendee(params, restricted=True)
         if 'first_name' in params:
-            message = check(attendee) or check_prereg_reqs(attendee)
+            message = check(attendee, prereg=True)
             if not message and not params['first_name']:
                 message = 'First and Last Name are required fields'
             if not message:
                 if not group.floating:
                     raise HTTPRedirect('group_members?id={}&message={}', group_id, 'No more unassigned badges exist in this group')
-
-                if attendee.full_name in c.BANNED_ATTENDEES:
-                    send_banned_email(attendee)
 
                 badge_being_claimed = group.floating[0]
 
@@ -432,7 +396,7 @@ class Root:
         attendee = session.attendee(params, restricted=True)
 
         if 'first_name' in params:
-            message = check(attendee) or check_prereg_reqs(attendee)
+            message = check(attendee, prereg=True)
             if not message and (not params['first_name'] and not params['last_name']):
                 message = 'First and Last names are required.'
             if not message:
@@ -441,9 +405,6 @@ class Root:
                     send_email(c.REGDESK_EMAIL, [old.email, attendee.email, c.REGDESK_EMAIL], subject, body, model=attendee)
                 except:
                     log.error('unable to send badge change email', exc_info=True)
-
-                if attendee.full_name in c.BANNED_ATTENDEES:
-                    send_banned_email(attendee)
 
                 if attendee.amount_unpaid:
                     cherrypy.session['return_to'] = 'group_members?id={}&'.format(attendee.group_id)
@@ -462,13 +423,21 @@ class Root:
             'message':  message
         }
 
+    def invalid_badge(self, session, id, message=''):
+        return {'attendee': session.attendee(id, allow_invalid=True), 'message': message}
+
+    def invalidate(self, session, id):
+        attendee = session.attendee(id)
+        attendee.badge_status = c.INVALID_STATUS
+        raise HTTPRedirect('invalid_badge?id={}&message={}', attendee.id, 'Sorry you can\'t make it! We hope to see you next year!')
+
     def confirm(self, session, message='', return_to='confirm', undoing_extra='', **params):
         attendee = session.attendee(params, restricted=True)
 
         placeholder = attendee.placeholder
-        if 'email' in params:
+        if 'email' in params and not message:
             attendee.placeholder = False
-            message = check(attendee) or check_prereg_reqs(attendee)
+            message = check(attendee, prereg=True)
             if not message:
                 if placeholder:
                     message = 'Your registration has been confirmed.'
