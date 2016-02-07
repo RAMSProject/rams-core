@@ -33,6 +33,14 @@ def check_atd(func):
 @all_renderable(c.PEOPLE, c.REG_AT_CON)
 class Root:
     def index(self, session, message='', page='0', search_text='', uploaded_id='', order='last_first', invalid=''):
+        # DEVELOPMENT ONLY: it's an extremely convenient shortcut to show the first page
+        # of search results when doing testing. it's too slow in production to do this by
+        # default due to the possibility of large amounts of reg stations accessing this
+        # page at once. viewing the first page is also rarely useful in production when
+        # there are thousands of attendees.
+        if c.DEV_BOX and not int(page):
+            page = 1
+
         filter = Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]) if not invalid else None
         attendees = session.query(Attendee) if invalid else session.query(Attendee).filter(filter)
         total_count = attendees.count()
@@ -101,11 +109,14 @@ class Root:
                     attendee.checked_in = localized_now()
                 session.add(attendee)
                 if return_to:
-                    raise HTTPRedirect(return_to + '&message={}', 'Attendee data uploaded')
+                    raise HTTPRedirect(return_to + '&message={}', 'Attendee data saved')
                 else:
-                    raise HTTPRedirect('index?uploaded_id={}&message={}&search_text={}', attendee.id,
-                        '{} has been uploaded'.format(attendee.full_name),
-                        '{} {}'.format(attendee.first_name, attendee.last_name) if c.AT_THE_CON else '')
+                    msg_text = '{} has been saved'.format(attendee.full_name)
+                    if params.get('save') == 'save_return_to_search':
+                        raise HTTPRedirect('index?uploaded_id={}&message={}&search_text={}', attendee.id, msg_text,
+                            '{} {}'.format(attendee.first_name, attendee.last_name) if c.AT_THE_CON else '')
+                    else:
+                        raise HTTPRedirect('form?id={}&message={}', attendee.id, msg_text)
 
         return {
             'message':    message,
@@ -353,7 +364,10 @@ class Root:
         return 'Attendee successfully un-checked-in'
 
     def recent(self, session):
-        return {'attendees': session.query(Attendee).order_by(Attendee.registered.desc())}
+        return {'attendees': session.query(Attendee)
+                                    .options(joinedload(Attendee.group))
+                                    .order_by(Attendee.registered.desc())
+                                    .limit(1000)}
 
     def merch(self, message=''):
         return {'message': message}
@@ -772,17 +786,13 @@ class Root:
             'who_opts': [who for [who] in session.query(Tracking).distinct().order_by(Tracking.who).values(Tracking.who)]
         }
 
-    def staffers(self, session, message='', order='first_name', search_text=''):
-        jobs, shifts, staffers = session.everything()
-        if search_text:
-            staffers = session.search(search_text, Attendee.staffing == True).options(joinedload(Attendee.shifts)).all()
+    def staffers(self, session, message='', order='first_name'):
+        staffers = session.staffers().all()
         return {
             'order': Order(order),
             'message': message,
-            'search_text': search_text,
-            'staffer_count': len(staffers),
-            'total_hours': sum(j.weighted_hours * j.slots for j in jobs),
-            'taken_hours': sum(s.job.weighted_hours for s in shifts),
+            'taken_hours': sum([s.weighted_hours - s.nonshift_hours for s in staffers], 0.0),
+            'total_hours': sum([j.weighted_hours * j.slots for j in session.query(Job).all()], 0.0),
             'staffers': sorted(staffers, reverse=order.startswith('-'), key=lambda s: getattr(s, order.lstrip('-')))
         }
 
@@ -890,6 +900,14 @@ class Root:
             'placeholders': [a for a in session.query(Attendee)
                                                .filter(Attendee.placeholder == True,
                                                        Attendee.staffing == True,
+                                                       Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]),
                                                        Attendee.assigned_depts.contains(department))
                                                .order_by(Attendee.full_name).all()]
+        }
+
+    def inactive(self, session):
+        return {
+            'attendees': session.query(Attendee)
+                                .filter(~Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]))
+                                .order_by(Attendee.badge_status, Attendee.full_name).all()
         }

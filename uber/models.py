@@ -571,25 +571,44 @@ class Session(SessionManager):
             attendee.badge_type = badge_type
             return 'Badge updated'
 
-        def everyone(self):
-            attendees = self.query(Attendee).filter(Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS])).options(joinedload(Attendee.group)).all()
-            groups = self.query(Group).options(joinedload(Group.attendees)).all()
-            return attendees, groups
-
         def valid_attendees(self):
             return self.query(Attendee).filter(Attendee.badge_status != c.INVALID_STATUS)
 
-        def staffers(self):
-            return self.query(Attendee) \
-                       .filter_by(staffing=True) \
-                       .options(joinedload(Attendee.group)) \
-                       .order_by(Attendee.full_name)
+        def staffers(self, only_staffing=True):
+            """
+            Returns a Query of attendees with efficient loading for groups and
+            shifts/jobs.  By default we only return attendees where "staffing"
+            is true, because before the event people can't sign up for shifts
+            unless they're marked as volunteers.  However, on-site we relax that
+            restriction, so we'll get attendees with shifts who are not actually
+            marked as staffing.  We therefore have an optional parameter for
+            clients to indicate that all attendees should be returned.
+            """
+            return (self.query(Attendee)
+                        .filter(Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]),
+                                *[Attendee.staffing == True] if only_staffing else [])
+                        .options(subqueryload(Attendee.group), subqueryload(Attendee.shifts).subqueryload(Shift.job))
+                        .order_by(Attendee.full_name))
+
+        def jobs(self, location=None):
+            return (self.query(Job)
+                        .filter_by(**{'location': location} if location else {})
+                        .order_by(Job.name, Job.start_time)
+                        .options(subqueryload(Job.shifts).subqueryload(Shift.attendee).subqueryload(Attendee.group)))
+
+        def staffers_for_dropdown(self):
+            return [{
+                'id': id,
+                'full_name': full_name.title()
+            } for id, full_name in self.query(Attendee.id, Attendee.full_name)
+                                       .filter_by(staffing=True)
+                                       .order_by(Attendee.full_name)]
 
         def single_dept_heads(self, dept=None):
             assigned = {'assigned_depts': str(dept)} if dept else {}
-            return self.query(Attendee) \
-                       .filter_by(ribbon=c.DEPT_HEAD_RIBBON, **assigned) \
-                       .order_by(Attendee.full_name).all()
+            return (self.query(Attendee)
+                        .filter_by(ribbon=c.DEPT_HEAD_RIBBON, **assigned)
+                        .order_by(Attendee.full_name).all())
 
         def match_to_group(self, attendee, group):
             with c.BADGE_LOCK:
@@ -605,35 +624,6 @@ class Session(SessionManager):
                     self.delete(matching[0])
                     self.add(attendee)
                     self.commit()
-
-        def everything(self, location=None):
-            location_filter = [Job.location == location] if location else []
-            jobs = self.query(Job) \
-                       .filter(*location_filter) \
-                       .options(joinedload(Job.shifts)) \
-                       .order_by(Job.start_time, Job.duration, Job.name).all()
-            shifts = self.query(Shift) \
-                         .filter(*location_filter) \
-                         .options(joinedload(Shift.job), joinedload(Shift.attendee)) \
-                         .join(Shift.job).order_by(Job.start_time).all()
-            attendees = [a for a in self.query(Attendee)
-                                        .filter_by(staffing=True)
-                                        .options(joinedload(Attendee.shifts), joinedload(Attendee.group))
-                                        .order_by(Attendee.full_name).all()
-                         if c.AT_THE_CON or not location or int(location) in a.assigned_depts_ints]
-
-            # PERFORMANCE OPTIMIZATION: Job.available_volunteers uses a @cached_property decorator.  This decorator
-            # populates job._available_volunteers.  Because this function is returning a huge amount of Jobs,
-            # we will pre-populate it here and skip the myriad database queries which would occur if we called
-            # .available_volunteers many times in a row.
-            #
-            # Note that this isn't exactly the same output as .available_volunteers, but this code should be kept
-            # in-sync as much as possible with Job.available_volunteers.  This is messy but needed to work around perf
-            # problems with pages that show large amounts of Jobs using everything()
-            for job in jobs:
-                job._available_volunteers = [a for a in attendees if not job.restricted or a.trusted_in(job.location)]
-
-            return jobs, shifts, attendees
 
         def search(self, text, *filters):
             attendees = self.query(Attendee).outerjoin(Attendee.group).options(joinedload(Attendee.group)).filter(*filters)
@@ -663,17 +653,17 @@ class Session(SessionManager):
                 return attendees.filter(or_(*checks))
 
         def delete_from_group(self, attendee, group):
-            '''
+            """
             Sometimes we want to delete an attendee badge which is part of a group.  In most cases, we could just
             say "session.delete(attendee)" but sometimes we need to make sure that the attendee is ALSO removed
             from the "group.attendees" list before we commit, since the number of attendees in a group is used in
             our presave_adjustments() code to update the group price.  So anytime we delete an attendee in a group,
             we should use this method.
-            '''
+            """
             self.delete(attendee)
             group.attendees.remove(attendee)
 
-        def assign_badges(self, group, new_badge_count, new_badge_type=c.ATTENDEE_BADGE, new_ribbon_type=None, **extra_create_args):
+        def assign_badges(self, group, new_badge_count, new_badge_type=c.ATTENDEE_BADGE, new_ribbon_type=None, paid=c.PAID_BY_GROUP, **extra_create_args):
             diff = int(new_badge_count) - group.badges
             sorted_unassigned = sorted(group.floating, key=lambda a: a.registered, reverse=True)
 
@@ -681,7 +671,7 @@ class Session(SessionManager):
 
             if diff > 0:
                 for i in range(diff):
-                    group.attendees.append(Attendee(badge_type=new_badge_type, ribbon=ribbon_to_use, paid=c.PAID_BY_GROUP, **extra_create_args))
+                    group.attendees.append(Attendee(badge_type=new_badge_type, ribbon=ribbon_to_use, paid=paid, **extra_create_args))
             elif diff < 0:
                 if len(group.floating) < abs(diff):
                     return 'You cannot reduce the number of badges for a group to below the number of assigned badges'
@@ -690,12 +680,10 @@ class Session(SessionManager):
                         self.delete_from_group(attendee, group)
 
         def assign(self, attendee_id, job_id):
-            '''
+            """
             assign an Attendee to a Job by creating a Shift
-
             :return: 'None' on success, error message on failure
-            '''
-
+            """
             job = self.job(job_id)
             attendee = self.attendee(attendee_id)
 
@@ -817,7 +805,22 @@ class Group(MagModel, TakesPaymentMixin):
         return self.attendees
 
     @property
+    def unassigned(self):
+        """
+        Returns a list of the unassigned badges for this group, sorted so that
+        the paid-by-group badges come last, because when claiming unassigned
+        badges we want to claim the "weird" ones first.
+        """
+        return sorted([a for a in self.attendees if a.is_unassigned], key=lambda a: a.paid == c.PAID_BY_GROUP)
+
+    @property
     def floating(self):
+        """
+        Returns the list of paid-by-group unassigned badges for this group. This
+        is a separate property from the "Group.unassigned" property because when
+        automatically adding or removing unassigned badges, we care specifically
+        about paid-by-group badges rather than all unassigned badges.
+        """
         return [a for a in self.attendees if a.is_unassigned and a.paid == c.PAID_BY_GROUP]
 
     @property
@@ -826,7 +829,7 @@ class Group(MagModel, TakesPaymentMixin):
 
     @property
     def ribbon_and_or_badge(self):
-        badge_being_claimed = self.floating[0]
+        badge_being_claimed = self.unassigned[0]
         if badge_being_claimed.ribbon != c.NO_RIBBON and badge_being_claimed.badge_type != c.ATTENDEE_BADGE:
             return badge_being_claimed.badge_type_label + " / " + self.ribbon_label
         elif badge_being_claimed.ribbon != c.NO_RIBBON:
@@ -1580,10 +1583,8 @@ class Job(MagModel):
     @cached_property
     def available_volunteers(self):
         """
-        Return a list of volunteers who are allowed to sign up for this Job AND have the free time to work it
-
-        IMPORTANT NOTE: If this code is ever changed, you also need to update session.everything() which
-        performs an optimized version of this operation on a bulk scale.
+        Returns a list of volunteers who are allowed to sign up for
+        this Job and have the free time to work it.
         """
         return [s for s in self._potential_volunteers(order_by=Attendee.last_first) if self.no_overlap(s)]
 
@@ -1666,9 +1667,13 @@ class Email(MagModel):
             return self.fk.full_name
 
     @property
+    def is_html(self):
+        return '<body' in self.body
+
+    @property
     def html(self):
-        if '<body>' in self.body:
-            return SafeString(self.body.split('<body>')[1].split('</body>')[0])
+        if self.is_html:
+            return SafeString(re.split('<body[^>]*>', self.body)[1].split('</body>')[0])
         else:
             return SafeString(self.body.replace('\n', '<br/>'))
 
