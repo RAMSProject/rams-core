@@ -296,7 +296,12 @@ class MagModel:
 
     @suffix_property
     def _label(self, name, val):
-        return '' if val is None else self.get_field(name).type.choices[int(val)]
+        try:
+            val = int(val)
+        except ValueError:
+            return val
+
+        return self.get_field(name).type.choices.get(val)
 
     @suffix_property
     def _local(self, name, val):
@@ -448,7 +453,10 @@ class Session(SessionManager):
 
         def checklist_status(self, slug, department):
             attendee = self.admin_attendee()
-            conf = DeptChecklistConf.instances[slug]
+            conf = DeptChecklistConf.instances.get(slug)
+            if not conf:
+                raise ValueError("Can't access dept checklist INI settings for section '{}', check your INI file".format(slug))
+
             return {
                 'conf': conf,
                 'relevant': attendee.is_single_dept_head and attendee.assigned_depts_ints == [int(department or 0)],
@@ -466,8 +474,8 @@ class Session(SessionManager):
 
         def guess_attendee_watchentry(self, attendee):
             return self.query(WatchList).filter(and_(or_(WatchList.first_names.contains(attendee.first_name),
-                                                         WatchList.email == attendee.email,
-                                                         WatchList.birthdate == attendee.birthdate),
+                                                         and_(WatchList.email != '', WatchList.email == attendee.email),
+                                                         and_(WatchList.birthdate != None, WatchList.birthdate == attendee.birthdate)),
                                                      WatchList.last_name == attendee.last_name,
                                                      WatchList.active == True)).all()
 
@@ -1165,11 +1173,24 @@ class Attendee(MagModel, TakesPaymentMixin):
         return self.badge_type_label in c.DAYS_OF_WEEK
 
     @property
-    def can_check_in(self):
-        valid = self.paid != c.NOT_PAID and self.badge_status in [c.NEW_STATUS, c.COMPLETED_STATUS] and not self.is_unassigned
-        if valid and self.is_presold_oneday:
-            valid = self.badge_type_label == localized_now().strftime('%A')
-        return valid
+    def is_not_ready_to_checkin(self):
+        """
+        :return: None if we are ready for checkin, otherwise a short error message why we can't check them in
+        """
+        if self.paid == c.NOT_PAID:
+            return "Not paid"
+
+        if self.badge_status not in [c.NEW_STATUS, c.COMPLETED_STATUS]:
+            return "Badge status"
+
+        if self.is_unassigned:
+            return "Badge not assigned"
+
+        if self.is_presold_oneday:
+            if self.badge_type_label != localized_now().strftime('%A'):
+                return "Wrong day"
+
+        return None
 
     @property
     def shirt_size_marked(self):
