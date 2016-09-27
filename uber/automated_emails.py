@@ -109,6 +109,8 @@ def days_before(days, dt, until=None):
     if dt:
         until = (dt - timedelta(days=until)) if until else dt
         return dt - timedelta(days=days) < localized_now() < until
+    else:
+        return None
 
 
 # Payment reminder emails, including ones for groups, which are always safe to be here, since they just
@@ -142,7 +144,7 @@ GroupEmail('Reminder to pre-assign {EVENT_NAME} group badges', 'reg_workflow/gro
            needs_approval=False)
 
 AutomatedEmail(Group, 'Last chance to pre-assign {EVENT_NAME} group badges', 'reg_workflow/group_preassign_reminder.txt',
-         lambda g: c.AFTER_GROUP_PREREG_TAKEDOWN and g.unregistered_badges and (not g.is_dealer or g.status == APPROVED),
+         lambda g: c.AFTER_GROUP_PREREG_TAKEDOWN and g.unregistered_badges and (not g.is_dealer or g.status == c.APPROVED),
          needs_approval=False)
 
 
@@ -155,7 +157,7 @@ MarketplaceEmail('Your {EVENT_NAME} Dealer registration has been approved', 'dea
                  needs_approval=False)
 
 MarketplaceEmail('Reminder to pay for your {EVENT_NAME} Dealer registration', 'dealers/payment_reminder.txt',
-                 lambda g: g.status == c.APPROVED and days_after(30, g.approved) and g.is_unpaid,
+                 lambda g: g.status == c.APPROVED and days_after(30, g.approved) and g.is_unpaid and c.DEALER_PAYMENT_DUE,
                  needs_approval=False)
 
 MarketplaceEmail('Your {EVENT_NAME} Dealer registration is due in one week', 'dealers/payment_reminder.txt',
