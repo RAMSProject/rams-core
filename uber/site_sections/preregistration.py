@@ -56,23 +56,13 @@ class Root:
         else:
             raise HTTPRedirect('index') if if_not_found is None else if_not_found
 
-    def stats(self):
-        cherrypy.response.headers["Access-Control-Allow-Origin"] = "*"
-        return json.dumps({
-            'badges_sold': c.BADGES_SOLD,
-            'remaining_badges': c.REMAINING_BADGES,
-
-            'server_current_timestamp': int(datetime.utcnow().timestamp()),
-            'warn_if_server_browser_time_mismatch': c.WARN_IF_SERVER_BROWSER_TIME_MISMATCH
-        })
-
     def kiosk(self):
         """
         Landing page for kiosk laptops, this should redirect to whichever page we want at-the-door laptop kiosks
         to land on.  The reason this is a redirect is that at-the-door laptops might be imaged and hard to change
         their default landing page.  If sysadmins want to change the landing page, they can do it here.
         """
-        raise HTTPRedirect('../registration/register')
+        raise HTTPRedirect(c.KIOSK_REDIRECT_URL)
 
     def check_prereg(self):
         return json.dumps({'force_refresh': not c.AT_THE_CON and (c.AFTER_PREREG_TAKEDOWN or c.BADGES_SOLD >= c.MAX_BADGE_SALES)})
@@ -105,13 +95,10 @@ class Root:
             }
 
     @check_if_can_reg
-    def badge_choice(self, message=''):
-        return {'message': message}
-
-    @check_if_can_reg
     def dealer_registration(self, message=''):
         return self.form(badge_type=c.PSEUDO_DEALER_BADGE, message=message)
 
+    @redirect_if_at_con_to_kiosk
     @check_if_can_reg
     def form(self, session, message='', edit_id=None, **params):
         params['id'] = 'None'   # security!
@@ -151,10 +138,13 @@ class Root:
                 if attendee.is_dealer:
                     session.add_all([attendee, group])
                     session.commit()
-                    send_email(c.MARKETPLACE_EMAIL, c.MARKETPLACE_EMAIL, 'Dealer Application Received',
-                               render('emails/dealers/reg_notification.txt', {'group': group}), model=group)
-                    send_email(c.MARKETPLACE_EMAIL, group.leader.email, 'Dealer Application Received',
-                               render('emails/dealers/dealer_received.txt', {'group': group}), model=group)
+                    try:
+                        send_email(c.MARKETPLACE_EMAIL, c.MARKETPLACE_EMAIL, 'Dealer Application Received',
+                                   render('emails/dealers/reg_notification.txt', {'group': group}), model=group)
+                        send_email(c.MARKETPLACE_EMAIL, group.leader.email, 'Dealer Application Received',
+                                   render('emails/dealers/dealer_received.txt', {'group': group}), model=group)
+                    except:
+                        log.error('unable to send marketplace application confirmation email', exc_info=True)
                     raise HTTPRedirect('dealer_confirmation?id={}', group.id)
                 else:
                     target = group if group.badges else attendee
@@ -328,10 +318,13 @@ class Root:
                 attendee.amount_paid = attendee.total_cost
                 session.merge(attendee)
 
-            if group.tables:
-                send_email(c.MARKETPLACE_EMAIL, c.MARKETPLACE_EMAIL, 'Dealer Payment Completed',
-                           render('emails/dealers/payment_notification.txt', {'group': group}), model=group)
             session.merge(group)
+            if group.tables:
+                try:
+                    send_email(c.MARKETPLACE_EMAIL, c.MARKETPLACE_EMAIL, 'Dealer Payment Completed',
+                               render('emails/dealers/payment_notification.txt', {'group': group}), model=group)
+                except:
+                    log.error('unable to send dealer payment confirmation email', exc_info=True)
             raise HTTPRedirect('group_members?id={}&message={}', group.id, 'Your payment has been accepted!')
 
     @credit_card
@@ -357,6 +350,7 @@ class Root:
             log.error('unable to send group unset email', exc_info=True)
 
         session.assign_badges(attendee.group, attendee.group.badges + 1, registered=attendee.registered, paid=attendee.paid)
+        attendee.group.cost -= attendee.group.new_badge_cost  # We add this value to the group in assign_badges; undo!
         session.delete_from_group(attendee, attendee.group)
         raise HTTPRedirect('group_members?id={}&message={}', attendee.group_id, 'Attendee unset; you may now assign their badge to someone else')
 
@@ -397,7 +391,7 @@ class Root:
         attendee = session.attendee(params, restricted=True)
 
         if 'first_name' in params:
-            message = check(attendee) or check_prereg_reqs(attendee)
+            message = check(attendee, prereg=True)
             if old.first_name == attendee.first_name and old.last_name == attendee.last_name:
                 message = 'You cannot transfer your badge to yourself.'
             elif not message and (not params['first_name'] and not params['last_name']):
@@ -483,6 +477,9 @@ class Root:
 
     def attendee_donation_form(self, session, id, message=''):
         attendee = session.attendee(id)
+        if attendee.amount_unpaid <= 0:
+            raise HTTPRedirect('confirm?id={}', id)
+
         return {
             'message': message,
             'attendee': attendee,
