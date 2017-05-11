@@ -216,7 +216,7 @@ def _record_email_sent(email):
 
 
 class Charge:
-    def __init__(self, targets=(), amount=None, description=None):
+    def __init__(self, targets=(), amount=None, description=None, email=''):
         self.targets = [self.to_sessionized(m) for m in listify(targets)]
 
         # performance optimization
@@ -224,6 +224,7 @@ class Charge:
 
         self.amount = amount or self.total_cost
         self.description = description or self.names
+        self.email = self.models[0].email if self.targets and self.models[0].email else email
 
     @staticmethod
     def to_sessionized(m):
@@ -255,7 +256,8 @@ class Charge:
         return {
             'targets': self.targets,
             'amount': self.amount,
-            'description': self.description
+            'description': self.description,
+            'email': self.email
         }
 
     @property
@@ -288,7 +290,8 @@ class Charge:
                 card=token,
                 currency='usd',
                 amount=self.amount,
-                description=self.description
+                description=self.description,
+                receipt_email=self.email
             )
         except stripe.CardError as e:
             return 'Your card was declined with the following error from our processor: ' + str(e)
@@ -332,14 +335,6 @@ def genpasswd():
             return ' '.join(random.choice(words) for i in range(4))
     except:
         return ''.join(chr(randrange(33, 127)) for i in range(8))
-
-
-def template_overrides(dirname):
-    """
-    Each event can have its own plugin and override our default templates with
-    its own by calling this method and passing its templates directory.
-    """
-    django.conf.settings.TEMPLATE_DIRS.insert(0, dirname)
 
 
 def static_overrides(dirname):

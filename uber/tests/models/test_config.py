@@ -1,11 +1,12 @@
+from uber import config
 from uber.tests import *
 
 
 class TestPrices:
-    def test_initial_attendee(self):
+    def test_initial_attendee(self, clear_price_bumps):
         assert 40 == c.get_attendee_price(datetime.now(UTC))
 
-    def test_group_member(self):
+    def test_group_member(self, clear_price_bumps):
         assert 30 == c.get_group_price(datetime.now(UTC))
 
 
@@ -106,3 +107,15 @@ class TestPriceLimits:
         assert 40 == c.get_attendee_price()
 
     # todo: Test badges that are paid by group
+
+
+class TestStaffGetFood:
+
+    def test_job_locations_with_food_prep(self):
+        assert c.STAFF_GET_FOOD
+
+    def test_job_locations_without_food_prep(self, monkeypatch):
+        job_locations = dict(c.JOB_LOCATIONS)
+        del job_locations[c.FOOD_PREP]
+        monkeypatch.setattr(c, 'JOB_LOCATIONS', job_locations)
+        assert not c.STAFF_GET_FOOD

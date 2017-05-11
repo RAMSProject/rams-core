@@ -1,3 +1,4 @@
+from sideboard.lib import profile
 from uber.common import *
 
 
@@ -269,25 +270,20 @@ def renderable_data(data=None):
 # render using the first template that actually exists in template_name_list
 def render(template_name_list, data=None):
     data = renderable_data(data)
-
-    try:
-        template = loader.select_template(listify(template_name_list))
-        rendered = template.render(Context(data))
-    except django.template.base.TemplateDoesNotExist:
-        raise
-    except Exception as e:
-        source_template_name = '[unknown]'
-        django_template_source_info = getattr(e, 'django_template_source')
-        if django_template_source_info:
-            for info in django_template_source_info:
-                if 'LoaderOrigin' in str(type(info)):
-                    source_template_name = info.name
-                    break
-        raise Exception('error rendering template [{}]'.format(source_template_name)) from e
+    env = JinjaEnv.env()
+    template = env.get_or_select_template(template_name_list)
+    rendered = template.render(data)
 
     # disabled for performance optimzation.  so sad. IT SHALL RETURN
     # rendered = screw_you_nick(rendered, template)  # lolz.
+
     return rendered.encode('utf-8')
+
+
+def render_empty(template_name_list):
+    env = JinjaEnv.env()
+    template = env.get_or_select_template(template_name_list)
+    return str(open(template.filename, 'r').read())
 
 
 # this is a Magfest inside joke.
@@ -380,12 +376,12 @@ def restricted(func):
     return with_restrictions
 
 
-def set_renderable(func, acccess):
+def set_renderable(func, access):
     """
     Return a function that is flagged correctly and is ready to be called by cherrypy as a request
     """
-    func.restricted = getattr(func, 'restricted', acccess)
-    new_func = timed(cached_page(sessionized(restricted(renderable(func)))))
+    func.restricted = getattr(func, 'restricted', access)
+    new_func = profile(timed(cached_page(sessionized(restricted(renderable(func))))))
     new_func.exposed = True
     return new_func
 
@@ -400,16 +396,6 @@ class all_renderable:
                 new_func = set_renderable(func, self.needs_access)
                 setattr(klass, name, new_func)
         return klass
-
-
-register = template.Library()
-
-
-def tag(klass):
-    @register.tag(klass.__name__)
-    def tagged(parser, token):
-        return klass(*token.split_contents()[1:])
-    return klass
 
 
 class Validation:

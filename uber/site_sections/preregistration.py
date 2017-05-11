@@ -432,7 +432,8 @@ class Root:
         return {
             'old':      old,
             'attendee': attendee,
-            'message':  message
+            'message':  message,
+            'affiliates': session.affiliates()
         }
 
     def invalid_badge(self, session, id, message=''):
@@ -486,12 +487,6 @@ class Root:
             'affiliates':    session.affiliates()
         }
 
-    def guest_food(self, session, id):
-        attendee = session.attendee(id)
-        assert attendee.badge_type == c.GUEST_BADGE, 'This form is for guests only'
-        cherrypy.session['staffer_id'] = attendee.id
-        raise HTTPRedirect('../signups/food_restrictions')
-
     @attendee_id_required
     def attendee_donation_form(self, session, id, message=''):
         attendee = session.attendee(id)
@@ -531,6 +526,7 @@ class Root:
         return {}
 
     # TODO: figure out if this is the best way to handle the issue of people not getting shirts
+    # TODO: this may be all now-dead one-time code (attendee.owed_shirt doesn't exist anymore)
     def shirt_reorder(self, session, message='', **params):
         attendee = session.attendee(params, restricted=True)
         assert attendee.owed_shirt, "There's no record of {} being owed a tshirt".format(attendee.full_name)
