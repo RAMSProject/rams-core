@@ -1,10 +1,6 @@
 from uber.common import *
-
-
-def _get_defaults(func):
-    spec = inspect.getfullargspec(func)
-    return dict(zip(reversed(spec.args), reversed(spec.defaults)))
-default_constructor = _get_defaults(declarative.declarative_base)['constructor']
+from uber.custom_tags import safe_string
+from sideboard.lib.sa import check_constraint_naming_convention
 
 
 SQLAlchemyColumn = Column
@@ -132,19 +128,27 @@ class MultiChoice(TypeDecorator):
         return value if isinstance(value, str) else ','.join(value)
 
 
-@declarative_base
+# Consistent naming conventions are necessary for alembic to be able to
+# reliably upgrade and downgrade versions. For more details, see:
+# http://alembic.zzzcomputing.com/en/latest/naming.html
+default_naming_convention = {
+    'ix': 'ix_%(column_0_label)s',
+    'uq': 'uq_%(table_name)s_%(column_0_name)s',
+    'fk': 'fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s',
+    'pk': 'pk_%(table_name)s'}
+
+if not c.SQLALCHEMY_URL.startswith('sqlite'):
+    default_naming_convention['unnamed_ck'] = check_constraint_naming_convention
+    default_naming_convention['ck'] = 'ck_%(table_name)s_%(unnamed_ck)s',
+
+default_metadata = MetaData(naming_convention=immutabledict(default_naming_convention))
+
+
+@declarative_base(metadata=default_metadata)
 class MagModel:
     id = Column(UUID, primary_key=True, default=lambda: str(uuid4()))
 
     required = ()
-
-    def __init__(self, *args, **kwargs):
-        if '_model' in kwargs:
-            assert kwargs.pop('_model') == self.__class__.__name__
-        default_constructor(self, *args, **kwargs)
-        for attr, col in self.__table__.columns.items():
-            if col.default:
-                self.__dict__.setdefault(attr, col.default.execute())
 
     @property
     def _class_attrs(self):
@@ -199,6 +203,15 @@ class MagModel:
         Because things like discounts exist, we ensure cost can never be negative.
         """
         return max(0, sum([getattr(self, name) for name in self.cost_property_names], 0))
+
+    @property
+    def stripe_transactions(self):
+        """
+
+        Returns: All logged Stripe transactions with this model's ID.
+
+        """
+        return self.session.query(StripeTransaction).filter_by(fk_id=self.id).all()
 
     @class_property
     def unrestricted(cls):
@@ -399,6 +412,21 @@ class MagModel:
             if not ignore_csrf:
                 check_csrf(params.get('csrf_token'))
 
+    def timespan(self, minute_increment=60):
+        minutestr = lambda dt: ':30' if dt.minute == 30 else ''
+        endtime = self.start_time_local + timedelta(minutes=minute_increment * self.duration)
+        startstr = self.start_time_local.strftime('%I').lstrip('0') + minutestr(self.start_time_local)
+        endstr = endtime.strftime('%I').lstrip('0') + minutestr(endtime) + endtime.strftime('%p').lower()
+
+        if self.start_time_local.day == endtime.day:
+            endstr += endtime.strftime(' %A')
+            if self.start_time_local.hour < 12 and endtime.hour >= 12:
+                return startstr + 'am - ' + endstr
+            else:
+                return startstr + '-' + endstr
+        else:
+            return startstr + self.start_time_local.strftime('pm %a - ') + endstr + endtime.strftime(' %a')
+
 
 class TakesPaymentMixin(object):
     @property
@@ -421,7 +449,7 @@ class Session(SessionManager):
     @classmethod
     def initialize_db(cls, modify_tables=False, drop=False):
         """
-        Initialize the database and optionally create/drop tables
+        Initialize the database and optionally create/drop tables.
 
         Initializes the database connection for use, and attempt to create any
         tables registered in our metadata which do not actually exist yet in the
@@ -432,16 +460,32 @@ class Session(SessionManager):
         all models from all plugins to insert their mixin data, so we wait until one spot
         in order to create the database tables.
 
-        Any calls to initialize_db() that do not specify modify_tables=True are ignored.
-        i.e. anywhere in Sideboard that calls initialize_db() will be ignored
-        i.e. ubersystem is forcing all calls that don't specify modify_tables=True to be ignored
+        Any calls to initialize_db() that do not specify modify_tables=True or
+        drop=True are ignored.
+
+        i.e. anywhere in Sideboard that calls initialize_db() will be ignored.
+        i.e. ubersystem is forcing all calls that don't specify modify_tables=True
+        or drop=True to be ignored.
+
+        Calling initialize_db with modify_tables=False and drop=True will leave
+        you with an empty database.
 
         Keyword Arguments:
-        modify_tables -- If False, this function does nothing.
-        drop -- USE WITH CAUTION: If True, then we will drop any tables in the database
+            modify_tables: If False, this function will not attempt to create
+                any database objects (tables, columns, constraints, etc...)
+                Defaults to False.
+            drop: USE WITH CAUTION: If True, then we will drop any tables in
+                the database. Defaults to False.
         """
         if modify_tables:
-            super(Session, cls).initialize_db(drop=drop)
+            super(Session, cls).initialize_db(drop=drop, create=True)
+            if drop:
+                from uber.migration import stamp
+                stamp('heads')
+        elif drop:
+            super(Session, cls).initialize_db(drop=True, create=False)
+            from uber.migration import stamp
+            stamp(None)
 
     class QuerySubclass(Query):
         @property
@@ -558,10 +602,9 @@ class Session(SessionManager):
             new_badge_num = self.auto_badge_num(badge_type)
             # Adjusts the badge number based on badges in the session
             for attendee in [m for m in chain(self.new, self.dirty) if isinstance(m, Attendee)]:
-                if attendee.badge_type == badge_type and attendee.badge_num is not None\
-                        and attendee.badge_num <= c.BADGE_RANGES[badge_type][1]\
-                        and attendee.badge_num <= self.auto_badge_num(badge_type):
-                    new_badge_num = max(self.auto_badge_num(badge_type), 1 + attendee.badge_num)
+                if attendee.badge_num is not None \
+                        and c.BADGE_RANGES[badge_type][0] <= attendee.badge_num <= c.BADGE_RANGES[badge_type][1]:
+                    new_badge_num = max(self.auto_badge_num(badge_type), 1 + attendee.badge_num, new_badge_num)
 
             assert new_badge_num < c.BADGE_RANGES[badge_type][1], 'There are no more badge numbers available in this range!'
 
@@ -580,8 +623,7 @@ class Session(SessionManager):
             """
             from uber.badge_funcs import needs_badge_num
             old_badge_num = int(old_badge_num or 0) or None
-            was_dupe_num = self.query(Attendee).filter(Attendee.badge_type == old_badge_type,
-                                                       Attendee.badge_num == old_badge_num,
+            was_dupe_num = self.query(Attendee).filter(Attendee.badge_num == old_badge_num,
                                                        Attendee.id != attendee.id).first()
 
             if not was_dupe_num and old_badge_type == attendee.badge_type and (not attendee.badge_num or old_badge_num == attendee.badge_num):
@@ -620,18 +662,17 @@ class Session(SessionManager):
             a specific range.
             :return:
             """
-            sametype = self.query(Attendee.badge_num).filter(Attendee.badge_type == badge_type,
-                                                   Attendee.badge_num >= c.BADGE_RANGES[badge_type][0],
-                                                   Attendee.badge_num <= c.BADGE_RANGES[badge_type][1])
-            if sametype.count():
-                sametype_list = [int(row[0]) for row in sametype.order_by(Attendee.badge_num).all()]
+            in_range = self.query(Attendee.badge_num).filter(Attendee.badge_num >= c.BADGE_RANGES[badge_type][0],
+                                                             Attendee.badge_num <= c.BADGE_RANGES[badge_type][1])
+            if in_range.count():
+                in_range_list = [int(row[0]) for row in in_range.order_by(Attendee.badge_num).all()]
 
                 # Searches badge range for a gap in badge numbers; if none found, returns the latest badge number + 1
                 # Doing this lets admins manually set high badge numbers without filling up the badge type's range.
-                start, end = c.BADGE_RANGES[badge_type][0], sametype_list[-1]
-                gap_nums = sorted(set(range(start, end + 1)).difference(sametype_list))
+                start, end = c.BADGE_RANGES[badge_type][0], in_range_list[-1]
+                gap_nums = sorted(set(range(start, end + 1)).difference(in_range_list))
                 if not gap_nums:
-                    return sametype.order_by(Attendee.badge_num.desc()).first().badge_num + 1
+                    return in_range.order_by(Attendee.badge_num.desc()).first().badge_num + 1
                 else:
                     return gap_nums[0]
             else:
@@ -646,8 +687,7 @@ class Session(SessionManager):
             assert len(direction) < 2, 'you cannot specify both up and down parameters'
             down = (not direction['up']) if 'up' in direction else direction.get('down', True)
             shift = -1 if down else 1
-            for a in self.query(Attendee).filter(Attendee.badge_type == badge_type,
-                                                 Attendee.badge_num is not None,
+            for a in self.query(Attendee).filter(Attendee.badge_num is not None,
                                                  Attendee.badge_num >= badge_num,
                                                  Attendee.badge_num <= until):
                 a.badge_num += shift
@@ -702,6 +742,9 @@ class Session(SessionManager):
 
         def valid_attendees(self):
             return self.query(Attendee).filter(Attendee.badge_status != c.INVALID_STATUS)
+
+        def attendees_with_badges(self):
+            return self.query(Attendee).filter(not_(Attendee.badge_status.in_([c.INVALID_STATUS, c.REFUNDED_STATUS, c.DEFERRED_STATUS])))
 
         def all_attendees(self, only_staffing=False):
             """
@@ -1177,7 +1220,7 @@ class Attendee(MagModel, TakesPaymentMixin):
             self.paid = c.NEED_NOT_PAY
 
         if c.AT_THE_CON and self.badge_num and not self.checked_in and \
-                (self.is_new or self.badge_type not in c.PREASSIGNED_BADGE_TYPES):
+                self.is_new and self.badge_type not in c.PREASSIGNED_BADGE_TYPES:
             self.checked_in = datetime.now(UTC)
 
         if self.birthdate:
@@ -1188,17 +1231,20 @@ class Attendee(MagModel, TakesPaymentMixin):
             if value.isupper() or value.islower():
                 setattr(self, attr, value.title())
 
+        if self.legal_name and self.full_name == self.legal_name:
+            self.legal_name = ''
+
     @presave_adjustment
     def _badge_adjustments(self):
         # _assert_badge_lock()
         from uber.badge_funcs import needs_badge_num
-        if self.is_dealer:
+        if self.badge_type == c.PSEUDO_DEALER_BADGE:
             self.ribbon = c.DEALER_RIBBON
 
         self.badge_type = get_real_badge_type(self.badge_type)
 
         if not needs_badge_num(self):
-            if self.orig_value_of('badge_num'):
+            if self.orig_value_of('badge_num') and c.SHIFT_CUSTOM_BADGES:
                 self.session.shift_badges(self.orig_value_of('badge_type'), self.orig_value_of('badge_num') + 1, down=True)
             self.badge_num = None
         elif needs_badge_num(self) and not self.badge_num:
@@ -1291,6 +1337,8 @@ class Attendee(MagModel, TakesPaymentMixin):
             return c.get_oneday_price(registered)
         elif self.is_presold_oneday:
             return c.get_presold_oneday_price(self.badge_type)
+        if self.badge_type in c.BADGE_TYPE_PRICES:
+            return int(c.BADGE_TYPE_PRICES[self.badge_type])
         elif self.age_discount != 0:
             return max(0, c.get_attendee_price(registered) + self.age_discount)
         elif self.group and self.paid == c.PAID_BY_GROUP:
@@ -1339,7 +1387,8 @@ class Attendee(MagModel, TakesPaymentMixin):
 
     @property
     def is_dealer(self):
-        return self.ribbon == c.DEALER_RIBBON or self.badge_type == c.PSEUDO_DEALER_BADGE
+        return self.ribbon == c.DEALER_RIBBON or self.badge_type == c.PSEUDO_DEALER_BADGE or \
+               (self.group and self.group.is_dealer and self.paid == c.PAID_BY_GROUP)
 
     @property
     def is_dept_head(self):
@@ -1604,12 +1653,30 @@ class Attendee(MagModel, TakesPaymentMixin):
         return any(shift.job.location == department for shift in self.shifts)
 
     @property
+    def food_restrictions_filled_out(self):
+        return self.food_restrictions if c.STAFF_GET_FOOD else True
+
+    @property
     def shift_prereqs_complete(self):
-        return not self.placeholder and self.food_restrictions and self.shirt_size_marked
+        return not self.placeholder and self.food_restrictions_filled_out and self.shirt_size_marked
 
     @property
     def past_years_json(self):
         return json.loads(self.past_years or '[]')
+
+    @property
+    def must_contact(self):
+        chairs = defaultdict(list)
+        for dept, head in c.DEPT_HEAD_OVERRIDES.items():
+            chairs[dept].append(head)
+        for head in self.session.query(Attendee).filter_by(ribbon=c.DEPT_HEAD_RIBBON).order_by('badge_num').all():
+            for dept in head.assigned_depts_ints:
+                chairs[dept].append(head.full_name)
+
+        locations = [s.job.location for s in self.shifts]
+        dept_names = dict(c.JOB_LOCATION_OPTS)
+        return safe_string('<br/>'.join(
+            sorted({'({}) {}'.format(dept_names[dept], ' / '.join(chairs[dept])) for dept in locations})))
 
 
 class WatchList(MagModel):
@@ -1813,7 +1880,7 @@ class Job(MagModel):
 
     @property
     def capable_volunteers_opts(self):
-        # format output for use with the {% options %} template decorator
+        # format output for use with the {{ options() }} template decorator
         return [(a.id, a.full_name) for a in self.capable_volunteers]
 
     @property
@@ -1883,6 +1950,17 @@ class ArbitraryCharge(MagModel):
     _repr_attr_names = ['what']
 
 
+class StripeTransaction(MagModel):
+    stripe_id = Column(UnicodeText, nullable=True)
+    type = Column(Choice(c.TRANSACTION_TYPE_OPTS), default=c.PAYMENT)
+    amount = Column(Integer)
+    when = Column(UTCDateTime, default=lambda: datetime.now(UTC))
+    who = Column(UnicodeText)
+    desc = Column(UnicodeText)
+    fk_id = Column(UUID)
+    fk_model = Column(UnicodeText)
+
+
 class ApprovedEmail(MagModel):
     ident = Column(UnicodeText)
 
@@ -1921,9 +1999,9 @@ class Email(MagModel):
     @property
     def html(self):
         if self.is_html:
-            return SafeString(re.split('<body[^>]*>', self.body)[1].split('</body>')[0])
+            return safe_string(re.split('<body[^>]*>', self.body)[1].split('</body>')[0])
         else:
-            return SafeString(self.body.replace('\n', '<br/>'))
+            return safe_string(self.body.replace('\n', '<br/>'))
 
 
 class PageViewTracking(MagModel):
