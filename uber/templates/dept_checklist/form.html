@@ -1,4 +1,4 @@
-{% extends "base-admin.html" %}
+{% extends "base.html" %}{% set admin_area=True %}
 {% block title %}Department Checklist - {{ item.name }}{% endblock %}
 {% block content %}
 
@@ -8,8 +8,8 @@
 {{ conf.description }}
 <br/> <br/>
 <input type="hidden" name="slug" value="{{ item.slug }}" />
-{% csrf_token %}
-<textarea name="comments" rows="5" cols="80">{{ item.comments|default:"" }}</textarea>
+{{ csrf_token() }}
+<textarea name="comments" rows="5" cols="80">{{ item.comments|default('') }}</textarea>
 <br/>
 <input type="submit" value="Upload" />
 {% if item.is_new %}
