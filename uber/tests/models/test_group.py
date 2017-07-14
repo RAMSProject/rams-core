@@ -19,6 +19,24 @@ def test_cost_presave_adjustment():
     g.presave_adjustments()
     assert g.cost == 0
 
+    g.auto_recalc = False
+    g.cost = ''
+    g.presave_adjustments()
+    assert g.cost == 0
+
+    g.auto_recalc = False
+    g.cost = 10
+    g.presave_adjustments()
+    assert g.cost == 10
+
+    g.amount_paid = ''
+    g.presave_adjustments()
+    assert g.amount_paid == 0
+
+    g.amount_refunded = ''
+    g.presave_adjustments()
+    assert g.amount_refunded == 0
+
 
 def test_approved_presave_adjustment():
     g = Group()
@@ -164,7 +182,7 @@ def test_assign_custom_badges_after_deadline(session, after_printed_badge_deadli
     assert message and 'ordered' in message
 
 
-def test_badge_cost(monkeypatch):
+def test_badge_cost(monkeypatch, clear_price_bumps):
     monkeypatch.setattr(c, 'get_group_price', Mock(return_value=c.DEALER_BADGE_PRICE + 10))
     assert 4 * c.DEALER_BADGE_PRICE + 20 == Group(attendees=[
         Attendee(paid=c.REFUNDED), Attendee(ribbon=c.DEALER_RIBBON),

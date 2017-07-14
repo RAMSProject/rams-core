@@ -1,4 +1,5 @@
 from uber.common import *
+from uber.custom_tags import safe_string
 
 
 @all_renderable(c.SIGNUPS)
@@ -109,9 +110,9 @@ class Root:
             try:
                 attendee = session.lookup_attendee(first_name.strip(), last_name.strip(), email, zip_code)
                 if not attendee.staffing:
-                    message = SafeString('You are not signed up as a volunteer.  <a href="volunteer?id={}">Click Here</a> to sign up.'.format(attendee.id))
+                    message = safe_string('You are not signed up as a volunteer.  <a href="volunteer?id={}">Click Here</a> to sign up.'.format(attendee.id))
                 elif not attendee.assigned_depts_ints and not c.AT_THE_CON:
-                    message = 'You have not been assigned to any departmemts; an admin must assign you to a department before you can log in'
+                    message = 'You have not been assigned to any departments; an admin must assign you to a department before you can log in'
             except:
                 message = 'No attendee matches that name and email address and zip code'
 

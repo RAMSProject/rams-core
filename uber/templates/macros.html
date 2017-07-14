@@ -1,0 +1,120 @@
+{% macro ie7_compatibility_check() -%}
+    <!--[if lte IE 7]>
+        <script>
+            if (!document.documentMode) { //if documentMode exists, this is a later IE in compatibility mode
+                alert("This website requires IE 8 or later.");
+            }
+        </script>
+    <![endif]-->
+{%- endmacro %}
+
+
+{% macro stripe_button(label) -%}
+    <button class="btn btn-primary stripe-button-el">
+        <span class="display: block; min-height: 30px;">{{label}}</span>
+    </button>
+{%- endmacro %}
+
+
+{% macro popup_link(href, text='<sup>?</sup>') -%}
+    <a onClick='window.open(&quot;{{ href }}&quot;, &quot;info&quot;, &quot;toolbar=no,height=500,width=375,scrollbars=yes&quot;).focus(); return false;' href='{{ href }}'>{{ text|safe }}</a>
+{%- endmacro %}
+
+
+{% macro checkbox(model, field_name, id=None, label=None, label_class=None, readonly=False, title=None) -%}
+    {% if label %}
+      <label
+        class="checkbox-label{% if label_class %} {{ label_class }}{% endif %}"
+        {% if title %}title="{{ title }}"{% endif %}>
+    {% endif %}
+    {% if readonly %}
+      <input
+        type="hidden"
+        name="{{ field_name }}"
+        id="{% if id %}{{ id }}{% else %}{{ field_name }}{% endif %}"
+        value="{%- if model[field_name] -%}1{%- else -%}0{%- endif -%}" />
+      <input
+        type="checkbox"
+        value="1"
+        disabled
+        {% if not label and title %}title="{{ title }}"{% endif %}
+        {% if model[field_name] %}checked{% endif %} />
+    {% else %}
+      <input
+        type="checkbox"
+        name="{{ field_name }}"
+        id="{% if id %}{{ id }}{% else %}{{ field_name }}{% endif %}"
+        value="1"
+        {% if not label and title %}title="{{ title }}"{% endif %}
+        {% if model[field_name] %}checked{% endif %} />
+    {% endif %}
+    {% if label %}{{ label }}</label>{% endif %}
+{%- endmacro %}
+
+
+{% macro checkgroup(model, field_name, no_instance=False) -%}
+    {%- set defaults = model[field_name] if not no_instance else None -%}
+    {%- set defaults = defaults.split(",") if defaults else [] -%}
+    {% for num, desc in model.get_field(field_name).type.choices -%}
+        <label class="checkgroup checkbox-label" style="font-weight: normal;">
+            <input type="checkbox" name="{{ field_name }}" value="{{ num }}" {% if num|string in defaults %}checked{% endif %} />
+            {{ desc }}
+        </label>
+    {% endfor %}
+{%- endmacro %}
+
+
+{% macro nav_menu(model, current_page_path) -%}
+    {% if not model.is_new -%}
+        <table class="menu"><tr>
+        {% for href, label, display in varargs|batch(3, False) if display %}
+            {% set href = href.format(**model.__dict__) %}
+            <td width="{{ 100 // loop.length }}%">
+                {%- if current_page_path.endswith(href.split('?')[0]) -%}
+                    {{ label }}
+                {%- else -%}
+                    <a href="{{ href }}">{{ label }}</a>
+                {%- endif -%}
+            </td>
+        {% endfor %}
+        </tr></table>
+    {%- endif %}
+{%- endmacro %}
+
+
+{% macro checklist_image(enabled) -%}
+    <img src="../static/images/checkbox_{% if not enabled %}un{% endif %}checked.png" style="vertical-align:top ; margin-right:5px" height="20" width="20" />
+{%- endmacro %}
+
+
+{% macro prereg_wizard(page_path, prereg_request_hotel_info_enabled) -%}
+  {%- if prereg_request_hotel_info_enabled -%}
+    {%-
+      set steps = [
+          (('form', 'post_form'), 'Enter Info'),
+          ('hotel', 'Hotel Booking'),
+          (('index', 'preregistration', ''), 'Review & Pay'),
+          ('paid_preregistrations', 'Done')]
+    -%}
+  {% else %}
+    {%-
+      set steps = [
+          (('form', 'post_form'), 'Enter Info'),
+          (('index', 'preregistration', ''), 'Review & Pay'),
+          ('paid_preregistrations', 'Done')]
+    -%}
+  {%- endif -%}
+  {%- set step_count = steps|length -%}
+  {%- set col_size = (12 / step_count)|round(0, 'floor')|int -%}
+  {%- set vars = {'is_complete': False} -%}
+  <div class="row bs-wizard">
+    {% for url, text in steps -%}
+      <div class="col-xs-{{ col_size }} bs-wizard-step {% if page_path|basename in url -%}active{%- if vars.update({'is_complete': True}) -%}{%- endif -%}{%- elif vars.is_complete -%}disabled{%- else -%}complete{%- endif %}">
+        <div class="text-center bs-wizard-stepnum">Step {{ loop.index }}</div>
+        <div class="progress"><div class="progress-bar"></div></div>
+        <a class="bs-wizard-dot"></a>
+        <div class="bs-wizard-info text-center">{{ text }}</div>
+      </div>
+    {%- endfor %}
+  </div>
+{%- endmacro %}

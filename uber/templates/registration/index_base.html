@@ -1,4 +1,4 @@
-{% extends "base-admin.html" %}
+{% extends "base.html" %}{% set admin_area=True %}
 {% block title %}Attendee Admin{% endblock %}
 {% block content %}
 
@@ -6,41 +6,6 @@
 <script type="text/javascript">
     $(function(){
         document.getElementById('search_bar').select();
-    });
-
-    function decrypt_checkin_code(barcode) {
-        $.ajax({
-            method: 'POST',
-            url: 'qrcode_reader',
-            dataType: 'json',
-            data: {qrcode: barcode, csrf_token: csrf_token},
-            success: function (json) {
-                toastr.clear();
-                var message = json.message;
-                if (json.success) {
-                    $("#search_bar").val(json.data).parents('form').submit()
-                } else {
-                    toastr.error(message);
-                }
-            },
-            error: function () {
-                toastr.error('Unable to connect to server, please try again.');
-            }
-        });
-    }
-
-    $(function(){
-        $("#qr-scan").click(function(){
-            bootbox.prompt({
-                title: "Scan 2D Barcode",
-                backdrop: true,
-                callback: function (result) {
-                    if(result) {
-                        decrypt_checkin_code(result);
-                    }
-                }
-            });
-        });
     });
 
 </script>
@@ -54,7 +19,7 @@
 {% endblock adminheader %}
 {% block admin_controls %}
 <div class="row">
-    <div class="panel col-md-5">
+    <div class="col-sm-6 col-md-4">
         <form role="form" method="get" action="index">
             <input type="hidden" name="order" value="{{ order }}" />
             <input type="hidden" name="invalid" value="{{ invalid }}" />
@@ -69,7 +34,7 @@
         </form>
     </div>
 
-    <div class="panel col-md-4">
+    <div class="col-sm-6 col-md-8">
         <a class="btn btn-primary" href="form?id=None">Add an attendee</a>
         <a class="btn btn-default" {% if not c.AT_THE_CON %}disabled="disabled"{% endif %}
            href="new">View Recent At-the-Door Registrations</a>
@@ -79,36 +44,49 @@
         {% else %}
             <a class="btn btn-info" href="index?order={{ order }}&page={{ page }}&search_text={{ search_text|urlencode }}&invalid=True">Show all badge statuses</a>
         {% endif %}
-
-        <button class="btn btn-primary" id="qr-scan">Scan 2D Barcode</button>
-    </div>
-    <div class="panel col-md-4">
-        <div class="col-md-6">{{ attendee_count }} Attendee{{ attendee_count|pluralize }}</div>
-        <div class="col-md-6"><span id="checkin_count">{{ checkin_count }}</span> Checked In</div>
     </div>
 </div>
+
+<div class="row" style="margin-top: 15px;">
+    <div class="col-xs-12">
+        <span style="margin-right: 15px;">{{ attendee_count }} Attendee{{ attendee_count|pluralize }}</span>
+        <span><span id="checkin_count">{{ checkin_count }}</span> Checked In</span>
+    </div>
+</div>
+
+
+
 {% if search_results %}
     <div class="panel panel-info">
+      <div class="panel-body">
         <a href="index?order={{ order }}&page=1&invalid={{ invalid }}">Click here</a> to view full attendee list instead of only search results.
+      </div>
     </div>
 {% endif %}
 {% endblock admin_controls %}
 {% block table %}
+<ul class="pagination{% if not page %} pagination-lg{% elif pages|length > 100 %} pagination-sm{% endif %}">
+{% for pagenum in pages %}
+    {% if pagenum == page %}
+    <li class="page-item active">
+        <a class="page-link" href="#">{{ pagenum }}</a>
+    </li>
+    {% else %}
+    <li class="page-item">
+        <a class="page-link" href="index?order={{ order }}&page={{ pagenum }}&search_text={{ search_text|urlencode }}&invalid={{ invalid }}">{{ pagenum }}</a>
+    {% endif %}
+    </li>
+{% endfor %}
+</ul>
 <div class="panel panel-default">
-    {% for pagenum in pages %}
-        {% if pagenum == page %}
-            {{ pagenum }}
-        {% else %}
-            <a href="index?order={{ order }}&page={{ pagenum }}&search_text={{ search_text|urlencode }}&invalid={{ invalid }}">{{ pagenum }}</a>
-        {% endif %}
-    {% endfor %}
     {% if page %}
-        <table class="table table-striped" data-page-size="9999999">
-        <thead><tr>
+      <table class="table table-striped" data-page-size="9999999">
+        <thead>
+          <tr>
             {% block tableheadings %}
             <th> <a href="index?order={{ order.group_id }}">Group Name</a> </th>
-            <th> <a href="index?order={{ order.last_first }}">Preferred Name</a> </th>
-            <th> <a href="index?order={{ order.legal_name }}">Legal Name</a> </th>
+            <th> <a href="index?order={{ order.last_first }}">Full Name</a> </th>
+            <th> <a href="index?order={{ order.legal_name }}">Name on ID</a> </th>
             {% if c.PREASSIGNED_BADGE_TYPES %}<th> <a href="index?order={{ order.badge_printed_name }}">Badge Name</a> </th>{% endif %}
             <th> <a href="index?order={{ order.badge_type }}">Membership Type</a></th>
             {% if c.NUMBERED_BADGES %}<th> <a href="index?order={{ order.badge_num }}">Badge #</a> </th> {% endif %}
@@ -120,13 +98,16 @@
                 <th> <a href="index?order={{ order.checked_in }}"><nobr>Checked In</nobr></a> </th>
             {% endif %}
             {% endblock tableheadings %}
-        </tr></thead>
+          </tr>
+        </thead>
         <tbody>
-        {% for attendee in attendees %}
+          {% for attendee in attendees %}
             <tr {% if attendee.badge_status == c.INVALID_STATUS %}bgcolor="#FFE4E1"{% endif %}>
-                {% block tablerows %}
+                {% block tablerows scoped %}
                 <td id="group_{{ attendee.id }}">
+                    {% if attendee.group %}
                     <a href="../groups/form?id={{ attendee.group.id }}">{{ attendee.group.name }}</a>
+                    {% endif %}
                 </td>
                 <td id="name_{{ attendee.id }}" style="text-align:left">
                     <a href="form?id={{ attendee.id }}">{{ attendee.last_first }}</a>
@@ -147,7 +128,7 @@
                                 {% if attendee.paid == c.LOST_BADGE %}
                                     <strong>Badge reported as lost!</strong>
                                 {% else %}
-                                    {{ attendee.checked_in_local|time:"fA"|lower }} {{ attendee.checked_in_local|date:"D" }} <br/>
+                                    {{ hour_day_local(attendee.checked_in) }} <br/>
                                     <form method="post" action="lost_badge">
                                         <input type="hidden" name="id" value="{{ attendee.id }}" />
                                         <input type="submit" value="Report Lost Badge">
@@ -162,16 +143,19 @@
                         </td>
                     {% endif %}
                 {% endif %}
-                {% endblock tablerows %}
+              {% endblock tablerows %}
             </tr>
-        {% endfor %}
+          {% endfor %}
         </tbody>
-    </table>
-</div>
-{% else %}
-    <div class="center">
+      </table>
+    {% else %}
+      <div class="lead text-center">
         <em>Use the search box above to filter the attendees or select a page to browse all attendees.</em>
-    </div>
-{% endif %}
+        <br/><br/>Try searching for 'email:name@example.com' or 'group:Group Name'. You can also search by phone number,
+        unique confirmation ID, and most text fields.
+      </div>
+    {% endif %}
+</div>
+
 {% endblock table %}
 {% endblock content %}

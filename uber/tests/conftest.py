@@ -18,71 +18,54 @@ def monkeypatch_db_column(column, patched_config_value):
     column.property.columns[0].type.choices = dict(patched_config_value)
 
 
-@pytest.fixture(scope='session')
-def sensible_defaults():
-    """
-    Our unit tests parse our config files, so we want to define
-    the default settings which can be overridden in fixtures.
-    """
-    c.POST_CON = False
-    c.AT_THE_CON = False
-    c.SHIFT_CUSTOM_BADGES = True
-    c.PRINTED_BADGE_DEADLINE = deadline_not_reached
-    c.DEV_BOX = False
-    c.SEND_EMAILS = False
-    c.EVENT_NAME = 'CoolCon9000'
-    c.HARDCORE_OPTIMIZATIONS_ENABLED = False
-    c.NUMBERED_BADGES = True
+def extract_message_from_html(html):
+    match = re.search(r"var message = '(.*)';", html)
+    return match.group(1) if match else None
 
-    # our tests should work no matter what departments exist, so we'll add these departments to use in our tests
-    patched_depts = {'console': 'Console', 'arcade': 'Arcade', 'con_ops': 'Fest Ops'}
 
-    c.make_enum('test_departments', patched_depts)
-    c.SHIFTLESS_DEPTS = [c.CON_OPS]
+@pytest.fixture()
+def GET(monkeypatch):
+    monkeypatch.setattr(cherrypy.request, 'method', 'GET')
 
-    # we want 2 preassigned types to test some of our logic, so we've
-    # set these even though Supporter isn't really a badge type anymore
-    c.PREASSIGNED_BADGE_TYPES = [c.STAFF_BADGE, c.SUPPORTER_BADGE]
-    c.BADGE_RANGES[c.STAFF_BADGE] = [1, 399]
-    c.BADGE_RANGES[c.SUPPORTER_BADGE] = [500, 999]
-    c.BADGE_RANGES[c.ATTENDEE_BADGE] = [3000, 5999]
 
-    # we need to set some default table prices so we can write tests against them without worrying about what's been configured
-    c.TABLE_PRICES = defaultdict(lambda: 400, {1: 100, 2: 200, 3: 300})
+@pytest.fixture()
+def POST(monkeypatch):
+    monkeypatch.setattr(cherrypy.request, 'method', 'POST')
 
-    # override whatever is in c.JOB_LOCATION with our own test data
-    # ensure that c.ARCADE and c.CONSOLES exist in any model columns using c.JOB_LOCATION
-    c.make_enum('job_location', patched_depts)
-    monkeypatch_db_column(Job.location, c.JOB_LOCATION_OPTS)
-    monkeypatch_db_column(Attendee.assigned_depts, c.JOB_LOCATION_OPTS)
-    monkeypatch_db_column(Attendee.trusted_depts, c.JOB_LOCATION_OPTS)
 
-    # ensure that we have uniform c.INTERESTS despite whatever is in the INI
-    c.make_enum('interest', {'console': 'Consoles', 'arcade': 'Arcade'})
-    monkeypatch_db_column(Attendee.interests, c.INTEREST_OPTS)
+@pytest.fixture()
+def csrf_token(monkeypatch):
+    token = '4a2cc6f4-bf9f-49d2-a925-00ff4e22ae4a'
+    monkeypatch.setitem(cherrypy.session, 'csrf_token', token)
+    monkeypatch.setitem(cherrypy.request.headers, 'CSRF-Token', token)
+    yield token
 
-    # default attendee prices
-    c.INITIAL_ATTENDEE = 40
-    c.GROUP_DISCOUNT = 10
-    c.DEALER_BADGE_PRICE = 20
-    c.PRICE_BUMPS = {}
 
-    # tests should turn this on to test the effects
-    c.HARDCORE_OPTIMIZATIONS_ENABLED = False
+@pytest.fixture()
+def admin_attendee():
+    with Session() as session:
+        session.insert_test_admin_account()
 
-    # set some other config values off just to be safe
-    c.AWS_ACCESS_KEY = ''
-    c.AWS_SECRET_KEY = ''
-    c.STRIPE_PUBLIC_KEY = ''
-    c.STRIPE_PRIVATE_KEY = ''
+    with Session() as session:
+        attendee = session.query(Attendee).filter(
+            Attendee.email == 'magfest@example.com').one()
+        cherrypy.session['account_id'] = attendee.admin_account.id
+        yield attendee
+        cherrypy.session['account_id'] = None
+        session.delete(attendee)
+
+
+@pytest.fixture
+def clear_price_bumps(request, monkeypatch):
+    monkeypatch.setattr(c, 'PRICE_BUMPS', {})
 
 
 @pytest.fixture(scope='session', autouse=True)
-def init_db(request, sensible_defaults):
+def init_db(request):
     if os.path.exists(TEST_DB_FILE):
         os.remove(TEST_DB_FILE)
     patch_session(Session, request)
-    initialize_db()
+    initialize_db(modify_tables=True)
     register_session_listeners()
     with Session() as session:
         session.add(Attendee(
@@ -194,6 +177,15 @@ def init_db(request, sensible_defaults):
             location=c.CONSOLE,
             restricted=True
         ))
+
+        session.add(PromoCode(code='ten percent off', discount=10,
+            discount_type=PromoCode.PERCENT_DISCOUNT))
+        session.add(PromoCode(code='ten dollars off', discount=10,
+            discount_type=PromoCode.FIXED_DISCOUNT))
+        session.add(PromoCode(code='ten dollar badge', discount=10,
+            discount_type=PromoCode.FIXED_PRICE))
+        session.add(PromoCode(code='free badge', discount=0, uses_allowed=100))
+
         session.commit()
 
 

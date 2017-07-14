@@ -94,7 +94,14 @@ class Root:
             if 'no_override' in params:
                 attendee.overridden_price = None
 
-            message = check(attendee)
+            message = ''
+            if c.BADGE_PROMO_CODES_ENABLED and 'promo_code' in params:
+                message = session.add_promo_code_to_attendee(
+                    attendee, params.get('promo_code'))
+
+            if not message:
+                message = check(attendee)
+
             if not message:
                 # Free group badges are only considered 'registered' when they are actually claimed.
                 if attendee.paid == c.PAID_BY_GROUP and attendee.group_id and attendee.group.cost == 0:
@@ -129,6 +136,7 @@ class Root:
     def change_badge(self, session, id, message='', **params):
         attendee = session.attendee(id, allow_invalid=True)
         if 'badge_type' in params:
+            from uber.badge_funcs import reset_badge_if_unchanged
             old_badge_type, old_badge_num = attendee.badge_type, attendee.badge_num
             attendee.badge_type = int(params['badge_type'])
             try:
@@ -139,7 +147,7 @@ class Root:
             message = check(attendee)
 
             if not message:
-                message = session.update_badge(attendee, old_badge_type, old_badge_num)
+                message = reset_badge_if_unchanged(attendee, old_badge_type, old_badge_num) or "Badge updated."
                 raise HTTPRedirect('form?id={}&message={}', attendee.id, message or '')
 
         return {
@@ -251,9 +259,12 @@ class Root:
                 session.delete_from_group(attendee, attendee.group)
                 message = 'Unassigned badge removed.'
             else:
-                session.add(Attendee(**{attr: getattr(attendee, attr) for attr in [
+                replacement_attendee = Attendee(**{attr: getattr(attendee, attr) for attr in [
                     'group', 'registered', 'badge_type', 'badge_num', 'paid', 'amount_paid', 'amount_extra'
-                ]}))
+                ]})
+                if replacement_attendee.group and replacement_attendee.group.is_dealer:
+                    replacement_attendee.ribbon == c.DEALER_RIBBON
+                session.add(replacement_attendee)
                 session.delete_from_group(attendee, attendee.group)
                 message = 'Attendee deleted, but this badge is still available to be assigned to someone else in the same group'
         else:
@@ -462,7 +473,8 @@ class Root:
                 if not attendee.merch:
                     message = '{a.full_name} ({a.badge}) has no merch'.format(a=attendee)
                 elif attendee.got_merch:
-                    message = '{a.full_name} ({a.badge}) already got {a.merch}'.format(a=attendee)
+                    message = '{a.full_name} ({a.badge}) already got {a.merch}.' \
+                              ' Their shirt size is {shirt}'.format(a=attendee, shirt=c.SHIRTS[attendee.shirt])
                 else:
                     id = attendee.id
                     shirt = (attendee.shirt or c.SIZE_UNKNOWN) if attendee.gets_any_kind_of_shirt else c.NO_SHIRT
@@ -600,7 +612,7 @@ class Root:
     def take_payment(self, session, payment_id, stripeToken):
         charge = Charge.get(payment_id)
         [attendee] = charge.attendees
-        message = charge.charge_cc(stripeToken)
+        message = charge.charge_cc(session, stripeToken)
         if message:
             raise HTTPRedirect('pay?id={}&message={}', attendee.id, message)
         else:
@@ -633,7 +645,8 @@ class Root:
                                          Attendee.first_name != '',
                                          Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]),
                                          *restrict_to)
-                                 .order_by(Attendee.registered).all()
+                                 .order_by(Attendee.registered).all(),
+            'Charge': Charge
         }
 
     def new_reg_station(self, reg_station='', message=''):
@@ -650,12 +663,10 @@ class Root:
             'reg_station': reg_station
         }
 
-    @csrf_protected
+    @ajax
     def mark_as_paid(self, session, id, payment_method):
         if cherrypy.session['reg_station'] == 0:
-            raise HTTPRedirect('new_reg_station?message={}', 'Reg station 0 is for prereg only and may not accept payments')
-        elif int(payment_method) == c.MANUAL:
-            raise HTTPRedirect('manual_reg_charge_form?id={}', id)
+            return {'success': False, 'message': 'Reg station 0 is for prereg only and may not accept payments'}
 
         attendee = session.attendee(id)
         attendee.paid = c.HAS_PAID
@@ -664,30 +675,24 @@ class Root:
         attendee.payment_method = payment_method
         attendee.amount_paid = attendee.total_cost
         attendee.reg_station = cherrypy.session['reg_station']
-        raise HTTPRedirect('new?message={}', 'Attendee marked as paid')
+        session.commit()
+        return {'success': True, 'message': 'Attendee marked as paid.', 'id': attendee.id}
 
-    def manual_reg_charge_form(self, session, id):
-        attendee = session.attendee(id)
-        if attendee.paid != c.NOT_PAID:
-            raise HTTPRedirect('new?message={}{}', attendee.full_name, ' is already marked as paid')
-
-        return {
-            'attendee': attendee,
-            'charge': Charge(attendee)
-        }
-
+    @ajax
     @credit_card
     def manual_reg_charge(self, session, payment_id, stripeToken):
         charge = Charge.get(payment_id)
         [attendee] = charge.attendees
-        message = charge.charge_cc(stripeToken)
+        message = charge.charge_cc(session, stripeToken)
         if message:
-            raise HTTPRedirect('new_credit_form?id={}&message={}', attendee.id, message)
+            return {'success': False, 'message': 'Error processing card: {}'.format(message)}
         else:
             attendee.paid = c.HAS_PAID
+            attendee.payment_method = c.MANUAL
             attendee.amount_paid = attendee.total_cost
             session.merge(attendee)
-            raise HTTPRedirect('new?message={}', 'Payment accepted')
+            session.commit()
+            return {'success': True, 'message': 'Payment accepted.', 'id': attendee.id}
 
     @csrf_protected
     def new_checkin(self, session, message='', **params):
@@ -735,7 +740,7 @@ class Root:
     @credit_card
     def arbitrary_charge(self, session, payment_id, stripeToken):
         charge = Charge.get(payment_id)
-        message = charge.charge_cc(stripeToken)
+        message = charge.charge_cc(session, stripeToken)
         if message:
             raise HTTPRedirect('arbitrary_charge_form?message={}', message)
         else:
@@ -785,7 +790,7 @@ class Root:
             'shift_id': shift_id,
             'attendee': attendee,
             'shifts':   Shift.dump(attendee.shifts),
-            'jobs':     [(job.id, '({}) [{}] {}'.format(custom_tags.timespan.pretty(job), job.location_label, job.name))
+            'jobs':     [(job.id, '({}) [{}] {}'.format(job.timespan(), job.location_label, job.name))
                          for job in session.query(Job)
                                            .outerjoin(Job.shifts)
                                            .filter(Job.location.in_(attendee.assigned_depts_ints),

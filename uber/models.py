@@ -1,10 +1,11 @@
+import textwrap
+import six
+from itertools import zip_longest
+from sqlalchemy import func, select, CheckConstraint
+from sqlalchemy.orm import column_property
 from uber.common import *
-
-
-def _get_defaults(func):
-    spec = inspect.getfullargspec(func)
-    return dict(zip(reversed(spec.args), reversed(spec.defaults)))
-default_constructor = _get_defaults(declarative.declarative_base)['constructor']
+from uber.custom_tags import safe_string
+from sideboard.lib.sa import check_constraint_naming_convention
 
 
 SQLAlchemyColumn = Column
@@ -132,19 +133,27 @@ class MultiChoice(TypeDecorator):
         return value if isinstance(value, str) else ','.join(value)
 
 
-@declarative_base
+# Consistent naming conventions are necessary for alembic to be able to
+# reliably upgrade and downgrade versions. For more details, see:
+# http://alembic.zzzcomputing.com/en/latest/naming.html
+default_naming_convention = {
+    'ix': 'ix_%(column_0_label)s',
+    'uq': 'uq_%(table_name)s_%(column_0_name)s',
+    'fk': 'fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s',
+    'pk': 'pk_%(table_name)s'}
+
+if not c.SQLALCHEMY_URL.startswith('sqlite'):
+    default_naming_convention['unnamed_ck'] = check_constraint_naming_convention
+    default_naming_convention['ck'] = 'ck_%(table_name)s_%(unnamed_ck)s',
+
+default_metadata = MetaData(naming_convention=immutabledict(default_naming_convention))
+
+
+@declarative_base(metadata=default_metadata)
 class MagModel:
     id = Column(UUID, primary_key=True, default=lambda: str(uuid4()))
 
     required = ()
-
-    def __init__(self, *args, **kwargs):
-        if '_model' in kwargs:
-            assert kwargs.pop('_model') == self.__class__.__name__
-        default_constructor(self, *args, **kwargs)
-        for attr, col in self.__table__.columns.items():
-            if col.default:
-                self.__dict__.setdefault(attr, col.default.execute())
 
     @property
     def _class_attrs(self):
@@ -199,6 +208,15 @@ class MagModel:
         Because things like discounts exist, we ensure cost can never be negative.
         """
         return max(0, sum([getattr(self, name) for name in self.cost_property_names], 0))
+
+    @property
+    def stripe_transactions(self):
+        """
+
+        Returns: All logged Stripe transactions with this model's ID.
+
+        """
+        return self.session.query(StripeTransaction).filter_by(fk_id=self.id).all()
 
     @class_property
     def unrestricted(cls):
@@ -370,22 +388,40 @@ class MagModel:
                     value = ','.join(map(str, params[column.name]))
                 elif isinstance(params[column.name], bool):
                     value = params[column.name]
+                elif params[column.name] is None:
+                    value = None
                 else:
                     value = str(params[column.name]).strip()
 
                 try:
-                    if isinstance(column.type, Float):
-                        value = float(value)
-                    elif isinstance(column.type, Choice) and value == '':
-                        value = None
+                    if value is None:
+                        pass  # Totally fine for value to be None
+                    elif isinstance(column.type, Float):
+                        if value == '':
+                            value = None
+                        else:
+                            value = float(value)
                     elif isinstance(column.type, (Choice, Integer)):
-                        value = int(float(value))
+                        if value == '':
+                            value = None
+                        else:
+                            value = int(float(value))
                     elif isinstance(column.type, UTCDateTime):
-                        value = c.EVENT_TIMEZONE.localize(datetime.strptime(value, c.TIMESTAMP_FORMAT))
+                        try:
+                            value = datetime.strptime(value, c.TIMESTAMP_FORMAT)
+                        except ValueError:
+                            value = dateparser.parse(value)
+                        value = c.EVENT_TIMEZONE.localize(value)
                     elif isinstance(column.type, Date):
-                        value = datetime.strptime(value, c.DATE_FORMAT).date()
-                except:
-                    pass
+                        try:
+                            value = datetime.strptime(value, c.DATE_FORMAT)
+                        except ValueError:
+                            value = dateparser.parse(value)
+                        value = value.date()
+                except Exception as error:
+                    log.debug(
+                        'Ignoring error coercing value for column {}.{}: {}',
+                        self.__tablename__, column.name, error)
 
                 setattr(self, column.name, value)
 
@@ -398,6 +434,23 @@ class MagModel:
 
             if not ignore_csrf:
                 check_csrf(params.get('csrf_token'))
+
+        return self
+
+    def timespan(self, minute_increment=60):
+        minutestr = lambda dt: ':30' if dt.minute == 30 else ''
+        endtime = self.start_time_local + timedelta(minutes=minute_increment * self.duration)
+        startstr = self.start_time_local.strftime('%I').lstrip('0') + minutestr(self.start_time_local)
+        endstr = endtime.strftime('%I').lstrip('0') + minutestr(endtime) + endtime.strftime('%p').lower()
+
+        if self.start_time_local.day == endtime.day:
+            endstr += endtime.strftime(' %A')
+            if self.start_time_local.hour < 12 and endtime.hour >= 12:
+                return startstr + 'am - ' + endstr
+            else:
+                return startstr + '-' + endstr
+        else:
+            return startstr + self.start_time_local.strftime('pm %a - ') + endstr + endtime.strftime(' %a')
 
 
 class TakesPaymentMixin(object):
@@ -419,9 +472,9 @@ class Session(SessionManager):
     engine = sqlalchemy.create_engine(c.SQLALCHEMY_URL, **_engine_kwargs)
 
     @classmethod
-    def initialize_db(cls, modify_tables=False, drop=False):
+    def initialize_db(cls, modify_tables=False, drop=False, initialize=False):
         """
-        Initialize the database and optionally create/drop tables
+        Initialize the database and optionally create/drop tables.
 
         Initializes the database connection for use, and attempt to create any
         tables registered in our metadata which do not actually exist yet in the
@@ -432,16 +485,28 @@ class Session(SessionManager):
         all models from all plugins to insert their mixin data, so we wait until one spot
         in order to create the database tables.
 
-        Any calls to initialize_db() that do not specify modify_tables=True are ignored.
-        i.e. anywhere in Sideboard that calls initialize_db() will be ignored
-        i.e. ubersystem is forcing all calls that don't specify modify_tables=True to be ignored
+        Any calls to initialize_db() that do not specify modify_tables=True or
+        drop=True are ignored.
+
+        i.e. anywhere in Sideboard that calls initialize_db() will be ignored.
+        i.e. ubersystem is forcing all calls that don't specify modify_tables=True
+        or drop=True to be ignored.
+
+        Calling initialize_db with modify_tables=False and drop=True will leave
+        you with an empty database.
 
         Keyword Arguments:
-        modify_tables -- If False, this function does nothing.
-        drop -- USE WITH CAUTION: If True, then we will drop any tables in the database
+            modify_tables: If False, this function will not attempt to create
+                any database objects (tables, columns, constraints, etc...)
+                Defaults to False.
+            drop: USE WITH CAUTION: If True, then we will drop any tables in
+                the database. Defaults to False.
         """
-        if modify_tables:
-            super(Session, cls).initialize_db(drop=drop)
+        if drop or modify_tables or initialize:
+            super(Session, cls).initialize_db(drop=drop, create=modify_tables)
+            if drop:
+                from uber.migration import stamp
+                stamp('heads' if modify_tables else None)
 
     class QuerySubclass(Query):
         @property
@@ -524,11 +589,26 @@ class Session(SessionManager):
             return [job.to_dict(fields) for job in jobs if job.restricted or frozenset(job.hours) not in restricted_hours]
 
         def guess_attendee_watchentry(self, attendee):
-            return self.query(WatchList).filter(and_(or_(WatchList.first_names.contains(attendee.first_name),
-                                                         and_(WatchList.email != '', WatchList.email == attendee.email),
-                                                         and_(WatchList.birthdate != None, WatchList.birthdate == attendee.birthdate)),
-                                                     WatchList.last_name == attendee.last_name,
-                                                     WatchList.active == True)).all()
+            or_clauses = [
+                func.lower(WatchList.first_names).contains(attendee.first_name.lower()),
+                and_(WatchList.email != '', func.lower(WatchList.email) == attendee.email.lower())]
+            if attendee.birthdate:
+                if isinstance(attendee.birthdate, six.string_types):
+                    try:
+                        birthdate = dateparser.parse(attendee.birthdate).date()
+                    except:
+                        log.debug('Error parsing attendee birthdate: {}'.format(attendee.birthdate))
+                    else:
+                        or_clauses.append(WatchList.birthdate == birthdate)
+                elif isinstance(attendee.birthdate, datetime):
+                    or_clauses.append(WatchList.birthdate == attendee.birthdate.date())
+                elif isinstance(attendee.birthdate, date):
+                    or_clauses.append(WatchList.birthdate == attendee.birthdate)
+
+            return self.query(WatchList).filter(and_(
+                or_(*or_clauses),
+                func.lower(WatchList.last_name) == attendee.last_name.lower(),
+                WatchList.active == True)).all()
 
         def get_account_by_email(self, email):
             return self.query(AdminAccount).join(Attendee).filter(func.lower(Attendee.email) == func.lower(email)).one()
@@ -537,12 +617,80 @@ class Session(SessionManager):
             return not self.query(Email).filter_by(subject=subject).all()
 
         def lookup_attendee(self, first_name, last_name, email, zip_code):
-            email = normalize_email(email)
             attendee = self.query(Attendee).iexact(first_name=first_name, last_name=last_name, email=email, zip_code=zip_code).filter(Attendee.badge_status != c.INVALID_STATUS).all()
             if attendee:
                 return attendee[0]
 
             raise ValueError('attendee not found')
+
+        def add_promo_code_to_attendee(self, attendee, code):
+            """
+            Convenience method for adding a promo code to an attendee.
+
+            This method sets both the `promo_code` and `promo_code_id`
+            properties of `attendee`. Due to the way the `Attendee.promo_code`
+            relationship is defined, the `Attendee.promo_code_id` isn't
+            automatically set, which makes this method a nice way of setting
+            both.
+
+            Arguments:
+                attendee (Attendee): The Attendee for which the promo code
+                    should be added.
+                code (str): The promo code as typed by an end user, or an
+                    empty string to unset the promo code.
+
+            Returns:
+                str: Either a failure message or an empty string
+                    indicating success.
+            """
+            code = code.strip() if code else ''
+            if code:
+                attendee.promo_code = self.lookup_promo_code(code)
+                if attendee.promo_code:
+                    attendee.promo_code_id = attendee.promo_code.id
+                    return ''
+                else:
+                    attendee.promo_code_id = None
+                    return 'The promo code you entered is invalid.'
+            else:
+                attendee.promo_code = None
+                attendee.promo_code_id = None
+                return ''
+
+        def lookup_promo_code(self, code):
+            """
+            Convenience method for finding a promo code by id or code.
+
+            Arguments:
+                code (str): The id or code to search for.
+
+            Returns:
+                PromoCode: Either the matching PromoCode object, or None if
+                    not found.
+            """
+            if isinstance(code, uuid.UUID):
+                code = code.hex
+
+            normalized_code = PromoCode.normalize_code(code)
+            if not normalized_code:
+                return None
+
+            unambiguous_code = PromoCode.disambiguate_code(code)
+            clause = or_(
+                PromoCode.normalized_code == normalized_code,
+                PromoCode.normalized_code == unambiguous_code)
+
+            # Make sure that code is a valid UUID before adding
+            # PromoCode.id to the filter clause
+            try:
+                promo_code_id = uuid.UUID(normalized_code).hex
+            except:
+                pass
+            else:
+                clause = clause.or_(PromoCode.id == promo_code_id)
+
+            return self.query(PromoCode).filter(clause).order_by(
+                PromoCode.normalized_code.desc()).first()
 
         def get_next_badge_num(self, badge_type):
             """
@@ -558,10 +706,9 @@ class Session(SessionManager):
             new_badge_num = self.auto_badge_num(badge_type)
             # Adjusts the badge number based on badges in the session
             for attendee in [m for m in chain(self.new, self.dirty) if isinstance(m, Attendee)]:
-                if attendee.badge_type == badge_type and attendee.badge_num is not None\
-                        and attendee.badge_num <= c.BADGE_RANGES[badge_type][1]\
-                        and attendee.badge_num <= self.auto_badge_num(badge_type):
-                    new_badge_num = max(self.auto_badge_num(badge_type), 1 + attendee.badge_num)
+                if attendee.badge_num is not None \
+                        and c.BADGE_RANGES[badge_type][0] <= attendee.badge_num <= c.BADGE_RANGES[badge_type][1]:
+                    new_badge_num = max(self.auto_badge_num(badge_type), 1 + attendee.badge_num, new_badge_num)
 
             assert new_badge_num < c.BADGE_RANGES[badge_type][1], 'There are no more badge numbers available in this range!'
 
@@ -569,7 +716,7 @@ class Session(SessionManager):
 
         def update_badge(self, attendee, old_badge_type, old_badge_num):
             """
-            This should be called whenever an attendee's badge type or badge number is changed by an admin. It checks
+            This should be called whenever an attendee's badge type or badge number is changed. It checks
             if the attendee will still require a badge number with their new badge type, and if so, sets their number
             to either the number specified by the admin or the lowest available badge number in that range.
 
@@ -579,19 +726,11 @@ class Session(SessionManager):
             :return:
             """
             from uber.badge_funcs import needs_badge_num
-            old_badge_num = int(old_badge_num or 0) or None
-            was_dupe_num = self.query(Attendee).filter(Attendee.badge_type == old_badge_type,
-                                                       Attendee.badge_num == old_badge_num,
-                                                       Attendee.id != attendee.id).first()
 
-            if not was_dupe_num and old_badge_type == attendee.badge_type and (not attendee.badge_num or old_badge_num == attendee.badge_num):
-                attendee.badge_num = old_badge_num
-                return 'Attendee is already {} with badge {}'.format(c.BADGES[old_badge_type], old_badge_num)
-
-            if c.SHIFT_CUSTOM_BADGES:
+            if c.SHIFT_CUSTOM_BADGES and c.BEFORE_PRINTED_BADGE_DEADLINE:
                 # fill in the gap from the old number, if applicable
                 badge_num_keep = attendee.badge_num
-                if old_badge_num and not was_dupe_num:
+                if old_badge_num:
                     self.shift_badges(old_badge_type, old_badge_num + 1, down=True)
 
                 # make room for the new number, if applicable
@@ -620,18 +759,17 @@ class Session(SessionManager):
             a specific range.
             :return:
             """
-            sametype = self.query(Attendee.badge_num).filter(Attendee.badge_type == badge_type,
-                                                   Attendee.badge_num >= c.BADGE_RANGES[badge_type][0],
-                                                   Attendee.badge_num <= c.BADGE_RANGES[badge_type][1])
-            if sametype.count():
-                sametype_list = [int(row[0]) for row in sametype.order_by(Attendee.badge_num).all()]
+            in_range = self.query(Attendee.badge_num).filter(Attendee.badge_num >= c.BADGE_RANGES[badge_type][0],
+                                                             Attendee.badge_num <= c.BADGE_RANGES[badge_type][1])
+            if in_range.count():
+                in_range_list = [int(row[0]) for row in in_range.order_by(Attendee.badge_num).all()]
 
                 # Searches badge range for a gap in badge numbers; if none found, returns the latest badge number + 1
                 # Doing this lets admins manually set high badge numbers without filling up the badge type's range.
-                start, end = c.BADGE_RANGES[badge_type][0], sametype_list[-1]
-                gap_nums = sorted(set(range(start, end + 1)).difference(sametype_list))
+                start, end = c.BADGE_RANGES[badge_type][0], in_range_list[-1]
+                gap_nums = sorted(set(range(start, end + 1)).difference(in_range_list))
                 if not gap_nums:
-                    return sametype.order_by(Attendee.badge_num.desc()).first().badge_num + 1
+                    return in_range.order_by(Attendee.badge_num.desc()).first().badge_num + 1
                 else:
                     return gap_nums[0]
             else:
@@ -646,62 +784,17 @@ class Session(SessionManager):
             assert len(direction) < 2, 'you cannot specify both up and down parameters'
             down = (not direction['up']) if 'up' in direction else direction.get('down', True)
             shift = -1 if down else 1
-            for a in self.query(Attendee).filter(Attendee.badge_type == badge_type,
-                                                 Attendee.badge_num is not None,
+            for a in self.query(Attendee).filter(Attendee.badge_num is not None,
                                                  Attendee.badge_num >= badge_num,
                                                  Attendee.badge_num <= until):
                 a.badge_num += shift
             return True
 
-        def change_badge(self, attendee, badge_type, badge_num=None):
-            """
-            Badges should always be assigned a number if they're marked as
-            pre-assigned or if they've been checked in.  If auto-shifting is
-            also turned off, badge numbers cannot clobber other numbers,
-            otherwise we'll shift all the other badge numbers around the old
-            and new numbers.
-            """
-            # assert_badge_locked()
-            from uber.badge_funcs import check_range
-            badge_type = int(badge_type)
-            old_badge_type, old_badge_num = attendee.badge_type, attendee.badge_num
-
-            out_of_range = check_range(badge_num, badge_type)
-            next = self.next_badge_num(badge_type, old_badge_num)
-            if out_of_range:
-                return out_of_range
-            elif not badge_num and next > c.BADGE_RANGES[badge_type][1]:
-                return 'There are no more badges available for that type'
-            elif badge_type in c.PREASSIGNED_BADGE_TYPES and c.AFTER_PRINTED_BADGE_DEADLINE:
-                return 'Custom badges have already been ordered'
-
-            if not c.SHIFT_CUSTOM_BADGES:
-                badge_num = badge_num or next
-                if badge_num != 0:
-                    existing = self.query(Attendee).filter_by(badge_type=badge_type, badge_num=badge_num) \
-                                                   .filter(Attendee.id != attendee.id)
-                    if existing.count():
-                        return 'That badge number already belongs to {!r}'.format(existing.first().full_name)
-            else:
-                # fill in the gap from the old number, if applicable
-                if old_badge_num:
-                    self.shift_badges(old_badge_type, old_badge_num + 1, down=True)
-
-                # determine the new badge number now that the badges have shifted
-                next = self.next_badge_num(badge_type, old_badge_num)
-                badge_num = min(int(badge_num) or next, next)
-
-                # make room for the new number, if applicable
-                if badge_num:
-                    offset = 1 if badge_type == old_badge_type and old_badge_num and badge_num > old_badge_num else 0
-                    self.shift_badges(badge_type, badge_num + offset, up=True)
-
-            attendee.badge_num = badge_num
-            attendee.badge_type = badge_type
-            return 'Badge updated'
-
         def valid_attendees(self):
             return self.query(Attendee).filter(Attendee.badge_status != c.INVALID_STATUS)
+
+        def attendees_with_badges(self):
+            return self.query(Attendee).filter(not_(Attendee.badge_status.in_([c.INVALID_STATUS, c.REFUNDED_STATUS, c.DEFERRED_STATUS])))
 
         def all_attendees(self, only_staffing=False):
             """
@@ -764,7 +857,7 @@ class Session(SessionManager):
             if ':' in text:
                 target, term = text.split(':', 1)
                 if target == 'email':
-                    return attendees.icontains(Attendee.email, term.strip())
+                    return attendees.icontains(Attendee.normalized_email, Attendee.normalize_email(term))
                 elif target == 'group':
                     return attendees.icontains(Group.name, term.strip())
 
@@ -887,6 +980,49 @@ class Session(SessionManager):
 
             return True
 
+        def bulk_insert(self, models):
+            """
+            Convenience method for bulk inserting model objects.
+
+            In general, doing a bulk insert is much faster than individual
+            inserts, but the whole insert will fail if a single object
+            violates the database's referential integrity.
+
+            This function does a bulk insert, but if an `IntegrityError` is
+            encountered, it falls back to inserting the model objects
+            one-by-one, and ignores the individual integrity errors.
+
+            Arguments:
+                models (list): A list of sqlalchemy model objects.
+
+            Returns:
+                list: A list of model objects that was succesfully inserted.
+                    The returned list will not include any model objects that
+                    failed insertion.
+            """
+            for model in models:
+                model.presave_adjustments()
+            try:
+                self.bulk_save_objects(models)
+                self.commit()
+                return models
+            except IntegrityError as error:
+                log.debug('Bulk insert failed: {}', error)
+                self.rollback()
+
+                # Bulk insert failed, so insert one at a time and ignore errors
+                inserted_models = []
+                for model in models:
+                    try:
+                        self.add(model)
+                        self.commit()
+                        inserted_models.append(model)
+                    except IntegrityError:
+                        log.debug('Individual insert failed: {}', error)
+                        # Ignore db integrity errors
+                        self.rollback()
+                return inserted_models
+
     @classmethod
     def model_mixin(cls, model):
         if model.__name__ in ['SessionMixin', 'QuerySubclass']:
@@ -941,6 +1077,12 @@ class Group(MagModel, TakesPaymentMixin):
             [self.leader] = assigned
         if self.auto_recalc:
             self.cost = self.default_cost
+        elif not self.cost:
+            self.cost = 0
+        if not self.amount_paid:
+            self.amount_paid = 0
+        if not self.amount_refunded:
+            self.amount_refunded = 0
         if self.status == c.APPROVED and not self.approved:
             self.approved = datetime.now(UTC)
         if self.leader and self.is_dealer:
@@ -1066,12 +1208,40 @@ class Group(MagModel, TakesPaymentMixin):
         else:
             return c.MIN_GROUP_ADDITION
 
+    @property
+    def requested_hotel_info(self):
+        if self.leader:
+            return self.leader.requested_hotel_info
+        elif self.leader_id:  # unattached groups
+            for attendee in self.attendees:
+                if attendee.id == self.leader_id:
+                    return attendee.requested_hotel_info
+        else:
+            return any(a.requested_hotel_info for a in self.attendees)
+
 
 class Attendee(MagModel, TakesPaymentMixin):
     watchlist_id = Column(UUID, ForeignKey('watch_list.id', ondelete='set null'), nullable=True, default=None)
 
     group_id = Column(UUID, ForeignKey('group.id', ondelete='SET NULL'), nullable=True)
     group = relationship(Group, backref='attendees', foreign_keys=group_id, cascade='save-update,merge,refresh-expire,expunge')
+
+    # NOTE: The cascade relationships for promo_code do NOT include
+    # "save-update". During the preregistration workflow, before an Attendee
+    # has paid, we create ephemeral Attendee objects that are saved in the
+    # cherrypy session, but are NOT saved in the database. If the cascade
+    # relationships specified "save-update" then the Attendee would
+    # automatically be inserted in the database when the promo_code is set on
+    # the Attendee object (which we do not want until the attendee pays).
+    #
+    # The practical result of this is that we must manually set promo_code_id
+    # in order for the relationship to be persisted.
+    promo_code_id = Column(UUID, ForeignKey('promo_code.id'), nullable=True,
+        index=True)
+    promo_code = relationship('PromoCode',
+        backref=backref('used_by', cascade='merge,refresh-expire,expunge'),
+        foreign_keys=promo_code_id,
+        cascade='merge,refresh-expire,expunge')
 
     placeholder   = Column(Boolean, default=False, admin_only=True)
     first_name    = Column(UnicodeText)
@@ -1092,6 +1262,9 @@ class Attendee(MagModel, TakesPaymentMixin):
     ec_name       = Column(UnicodeText)
     ec_phone      = Column(UnicodeText)
     cellphone     = Column(UnicodeText)
+
+    # Represents a request for hotel booking info during preregistration
+    requested_hotel_info = Column(Boolean, default=False)
 
     interests   = Column(MultiChoice(c.INTEREST_OPTS))
     found_how   = Column(UnicodeText)
@@ -1118,6 +1291,7 @@ class Attendee(MagModel, TakesPaymentMixin):
 
     paid             = Column(Choice(c.PAYMENT_OPTS), default=c.NOT_PAID, admin_only=True)
     overridden_price = Column(Integer, nullable=True, admin_only=True)
+    base_badge_price = Column(Integer, default=0, admin_only=True)
     amount_paid      = Column(Integer, default=0, admin_only=True)
     amount_extra     = Column(Choice(c.DONATION_TIER_OPTS, allow_unspecified=True), default=0)
     payment_method   = Column(Choice(c.PAYMENT_METHOD_OPTS), nullable=True)
@@ -1176,8 +1350,11 @@ class Attendee(MagModel, TakesPaymentMixin):
         if self.badge_cost == 0 and self.paid in [c.NOT_PAID, c.PAID_BY_GROUP]:
             self.paid = c.NEED_NOT_PAY
 
+        if not self.base_badge_price:
+            self.base_badge_price = self.new_badge_cost
+
         if c.AT_THE_CON and self.badge_num and not self.checked_in and \
-                (self.is_new or self.badge_type not in c.PREASSIGNED_BADGE_TYPES):
+                self.is_new and self.badge_type not in c.PREASSIGNED_BADGE_TYPES:
             self.checked_in = datetime.now(UTC)
 
         if self.birthdate:
@@ -1188,29 +1365,16 @@ class Attendee(MagModel, TakesPaymentMixin):
             if value.isupper() or value.islower():
                 setattr(self, attr, value.title())
 
-    @presave_adjustment
-    def _badge_adjustments(self):
-        # _assert_badge_lock()
-        from uber.badge_funcs import needs_badge_num
-        if self.is_dealer:
-            self.ribbon = c.DEALER_RIBBON
-
-        self.badge_type = get_real_badge_type(self.badge_type)
-
-        if not needs_badge_num(self):
-            if self.orig_value_of('badge_num'):
-                self.session.shift_badges(self.orig_value_of('badge_type'), self.orig_value_of('badge_num') + 1, down=True)
-            self.badge_num = None
-        elif needs_badge_num(self) and not self.badge_num:
-            self.badge_num = self.session.get_next_badge_num(self.badge_type)
+        if self.legal_name and self.full_name == self.legal_name:
+            self.legal_name = ''
 
     @presave_adjustment
     def _status_adjustments(self):
         if self.badge_status == c.NEW_STATUS and self.banned:
             self.badge_status = c.WATCHED_STATUS
             try:
-                send_email(c.SECURITY_EMAIL, [c.REGDESK_EMAIL, c.SECURITY_EMAIL], 'Banned attendee registration',
-                           render('emails/reg_workflow/banned_attendee.txt', {'attendee': self}), model='n/a')
+                send_email(c.SECURITY_EMAIL, [c.REGDESK_EMAIL, c.SECURITY_EMAIL], c.EVENT_NAME + ' WatchList Notification',
+                           render('emails/reg_workflow/attendee_watchlist.txt', {'attendee': self}), model='n/a')
             except:
                 log.error('unable to send banned email about {}', self)
         elif self.badge_status == c.NEW_STATUS and not self.placeholder and self.first_name \
@@ -1251,8 +1415,29 @@ class Attendee(MagModel, TakesPaymentMixin):
         self.trusted_depts = ','.join(str(td) for td in self.trusted_depts_ints if td in self.assigned_depts_ints)
 
     @presave_adjustment
-    def _email_adjustment(self):
-        self.email = normalize_email(self.email)
+    def _badge_adjustments(self):
+        # _assert_badge_lock()
+        from uber.badge_funcs import needs_badge_num
+        if self.badge_type == c.PSEUDO_DEALER_BADGE:
+            self.ribbon = c.DEALER_RIBBON
+
+        self.badge_type = get_real_badge_type(self.badge_type)
+
+        if not needs_badge_num(self):
+            self.badge_num = None
+
+        if self.orig_value_of('badge_type') != self.badge_type or self.orig_value_of('badge_num') != self.badge_num:
+            self.session.update_badge(self, self.orig_value_of('badge_type'), self.orig_value_of('badge_num'))
+        elif needs_badge_num(self) and not self.badge_num:
+            self.badge_num = self.session.get_next_badge_num(self.badge_type)
+
+    @presave_adjustment
+    def _use_promo_code(self):
+        if c.BADGE_PROMO_CODES_ENABLED and self.promo_code and not self.overridden_price and self.is_unpaid:
+            if self.badge_cost > 0:
+                self.overridden_price = self.badge_cost
+            else:
+                self.paid = c.NEED_NOT_PAY
 
     def unset_volunteering(self):
         self.staffing = False
@@ -1262,7 +1447,6 @@ class Attendee(MagModel, TakesPaymentMixin):
         if self.badge_type == c.STAFF_BADGE:
             self.badge_type = c.ATTENDEE_BADGE
             self.badge_num = None
-            self.session.update_badge(self, c.STAFF_BADGE, self.orig_value_of('badge_num'))
         del self.shifts[:]
 
     @property
@@ -1280,23 +1464,56 @@ class Attendee(MagModel, TakesPaymentMixin):
 
     @cost_property
     def badge_cost(self):
-        registered = self.registered_local if self.registered else None
+        return self.calculate_badge_cost()
+
+    @property
+    def badge_cost_without_promo_code(self):
+        return self.calculate_badge_cost(use_promo_code=False)
+
+    def calculate_badge_cost(self, use_promo_code=True):
         if self.paid == c.NEED_NOT_PAY:
             return 0
         elif self.overridden_price is not None:
             return self.overridden_price
-        elif self.is_dealer:
+        elif self.base_badge_price:
+            cost = self.base_badge_price
+        else:
+            cost = self.new_badge_cost
+
+        if c.BADGE_PROMO_CODES_ENABLED and self.promo_code and use_promo_code:
+            return self.promo_code.calculate_discounted_price(cost)
+        else:
+            return cost
+
+    @property
+    def new_badge_cost(self):
+        # What this badge would cost if it were new, i.e., not taking into account special overrides
+        registered = self.registered_local if self.registered else None
+        if self.is_dealer:
             return c.DEALER_BADGE_PRICE
         elif self.badge_type == c.ONE_DAY_BADGE:
             return c.get_oneday_price(registered)
         elif self.is_presold_oneday:
             return c.get_presold_oneday_price(self.badge_type)
+        elif self.badge_type in c.BADGE_TYPE_PRICES:
+            return int(c.BADGE_TYPE_PRICES[self.badge_type])
         elif self.age_discount != 0:
             return max(0, c.get_attendee_price(registered) + self.age_discount)
         elif self.group and self.paid == c.PAID_BY_GROUP:
             return c.get_attendee_price(registered) - c.GROUP_DISCOUNT
         else:
             return c.get_attendee_price(registered)
+
+    @property
+    def promo_code_code(self):
+        """
+        Convenience property for accessing `promo_code.code` if available.
+
+        Returns:
+            str: `promo_code.code` if `promo_code` is not `None`, empty string
+                otherwise.
+        """
+        return self.promo_code.code if self.promo_code else ''
 
     @property
     def age_discount(self):
@@ -1339,7 +1556,8 @@ class Attendee(MagModel, TakesPaymentMixin):
 
     @property
     def is_dealer(self):
-        return self.ribbon == c.DEALER_RIBBON or self.badge_type == c.PSEUDO_DEALER_BADGE
+        return self.ribbon == c.DEALER_RIBBON or self.badge_type == c.PSEUDO_DEALER_BADGE or \
+               (self.group and self.group.is_dealer and self.paid == c.PAID_BY_GROUP)
 
     @property
     def is_dept_head(self):
@@ -1409,6 +1627,18 @@ class Attendee(MagModel, TakesPaymentMixin):
         return case([
             (or_(cls.first_name == None, cls.first_name == ''), 'zzz')
         ], else_=func.lower(cls.last_name + ', ' + cls.first_name))
+
+    @hybrid_property
+    def normalized_email(self):
+        return self.normalize_email(self.email)
+
+    @normalized_email.expression
+    def normalized_email(cls):
+        return func.replace(func.lower(func.trim(cls.email)), '.', '')
+
+    @classmethod
+    def normalize_email(cls, email):
+        return email.strip().lower().replace('.', '')
 
     @property
     def watchlist_guess(self):
@@ -1491,7 +1721,7 @@ class Attendee(MagModel, TakesPaymentMixin):
             if self.paid_for_a_swag_shirt:
                 shirt = 'a 2nd ' + shirt
             if not self.volunteer_swag_shirt_earned:
-                shirt += ' (tell them they will be reported if they take their shirt then do not work their shifts)'
+                shirt += ' (this volunteer must work at least 6 hours or they will be reported for picking up their shirt)'
             merch.append(shirt)
 
         if self.gets_staff_shirt:
@@ -1604,12 +1834,513 @@ class Attendee(MagModel, TakesPaymentMixin):
         return any(shift.job.location == department for shift in self.shifts)
 
     @property
+    def food_restrictions_filled_out(self):
+        return self.food_restrictions if c.STAFF_GET_FOOD else True
+
+    @property
     def shift_prereqs_complete(self):
-        return not self.placeholder and self.food_restrictions and self.shirt_size_marked
+        return not self.placeholder and self.food_restrictions_filled_out and self.shirt_size_marked
 
     @property
     def past_years_json(self):
         return json.loads(self.past_years or '[]')
+
+    @property
+    def must_contact(self):
+        chairs = defaultdict(list)
+        for dept, head in c.DEPT_HEAD_OVERRIDES.items():
+            chairs[dept].append(head)
+        for head in self.session.query(Attendee).filter_by(ribbon=c.DEPT_HEAD_RIBBON).order_by('badge_num').all():
+            for dept in head.assigned_depts_ints:
+                chairs[dept].append(head.full_name)
+
+        locations = [s.job.location for s in self.shifts]
+        dept_names = dict(c.JOB_LOCATION_OPTS)
+        return safe_string('<br/>'.join(
+            sorted({'({}) {}'.format(dept_names[dept], ' / '.join(chairs[dept])) for dept in locations})))
+
+
+class PromoCodeWord(MagModel):
+    """
+    Words used to generate promo codes.
+
+    Attributes:
+        word (str): The text of this promo code word.
+        normalized_word (str): A normalized version of `word`, suitable for
+            database queries.
+        part_of_speech (int): The part of speech that `word` is.
+            Valid values are:
+
+            * 0 `ADJECTIVE`: `word` is an adjective
+
+            * 1 `NOUN`: `word` is a noun
+
+            * 2 `VERB`: `word` is a verb
+
+            * 3 `ADVERB`: `word` is an adverb
+
+        part_of_speech_str (str): A human readable description of
+            `part_of_speech`.
+    """
+
+    ADJECTIVE = 0
+    NOUN = 1
+    VERB = 2
+    ADVERB = 3
+    PART_OF_SPEECH_OPTS = [
+        (ADJECTIVE, 'adjective'),
+        (NOUN, 'noun'),
+        (VERB, 'verb'),
+        (ADVERB, 'adverb')]
+    PARTS_OF_SPEECH = dict(PART_OF_SPEECH_OPTS)
+
+    word = Column(UnicodeText)
+    part_of_speech = Column(Choice(PART_OF_SPEECH_OPTS), default=ADJECTIVE)
+
+    __table_args__ = (
+        Index('uq_promo_code_word_normalized_word_part_of_speech',
+            func.lower(func.trim(word)), part_of_speech, unique=True),
+        CheckConstraint(func.trim(word) != '',
+            name='ck_promo_code_word_non_empty_word'))
+
+    _repr_attr_names = ('word',)
+
+    @hybrid_property
+    def normalized_word(self):
+        return self.normalize_word(self.word)
+
+    @normalized_word.expression
+    def normalized_word(cls):
+        return func.lower(func.trim(cls.word))
+
+    @property
+    def part_of_speech_str(self):
+        return self.PARTS_OF_SPEECH[self.part_of_speech].title()
+
+    @presave_adjustment
+    def _attribute_adjustments(self):
+        # Replace multiple whitespace characters with a single space
+        self.word = re.sub(r'\s+', ' ', self.word.strip())
+
+    @classmethod
+    def group_by_parts_of_speech(cls, words):
+        """
+        Groups a list of words by their part_of_speech.
+
+        Arguments:
+            words (list): List of `PromoCodeWord`.
+
+        Returns:
+            OrderedDict: A dictionary of words mapped to their part of speech,
+                like this::
+
+                    OrderedDict([
+                        (0, ['adjective1', 'adjective2']),
+                        (1, ['noun1', 'noun2']),
+                        (2, ['verb1', 'verb2']),
+                        (3, ['adverb1', 'adverb2'])
+                    ])
+        """
+        parts_of_speech = OrderedDict(
+            [(i, []) for (i, _) in PromoCodeWord.PART_OF_SPEECH_OPTS])
+        for word in words:
+            parts_of_speech[word.part_of_speech].append(word.word)
+        return parts_of_speech
+
+    @classmethod
+    def normalize_word(cls, word):
+        """
+        Normalizes a word.
+
+        Arguments:
+            word (str): A word as typed by an admin.
+
+        Returns:
+            str: A copy of `word` converted to all lowercase, and multiple
+                whitespace characters replaced by a single space.
+        """
+        return re.sub(r'\s+', ' ', word.strip().lower())
+
+c.PROMO_CODE_WORD_PART_OF_SPEECH_OPTS = PromoCodeWord.PART_OF_SPEECH_OPTS
+c.PROMO_CODE_WORD_PARTS_OF_SPEECH = PromoCodeWord.PARTS_OF_SPEECH
+
+
+class PromoCode(MagModel):
+    """
+    Promo codes used by attendees to purchase badges at discounted prices.
+
+    Attributes:
+        code (str): The actual textual representation of the promo code. This
+            is what the attendee would have to type in during registration to
+            receive a discount. `code` may not be an empty string or a string
+            consisting entirely of whitespace.
+        discount (int): The discount amount that should be applied to the
+            purchase price of a badge. The interpretation of this value
+            depends on the value of `discount_type`. In any case, a value of
+            0 equates to a full discount, i.e. a free badge.
+        discount_str (str): A human readable description of the discount.
+        discount_type (int): The type of discount this promo code will apply.
+            Valid values are:
+
+            * 0 `FIXED_DISCOUNT`: `discount` is interpreted as a fixed
+                dollar amount by which the badge price should be reduced. If
+                `discount` is 49 and the badge price is normally $100, then
+                the discounted badge price would be $51.
+
+            * 1 `FIXED_PRICE`: `discount` is interpreted as the actual badge
+                price. If `discount` is 49, then the discounted badge price
+                would be $49.
+
+            * 2 `PERCENT_DISCOUNT`: `discount` is interpreted as a percentage
+                by which the badge price should be reduced. If `discount` is
+                20 and the badge price is normally $50, then the discounted
+                badge price would $40 ($50 reduced by 20%). If `discount` is
+                100, then the price would be 100% off, i.e. a free badge.
+
+        expiration_date (datetime): The date & time upon which this promo code
+            expires. An expired promo code may no longer be used to receive
+            discounted badges.
+        is_free (bool): True if this promo code will always cause a badge to
+            be free. False if this promo code may not cause a badge to be free.
+
+            Note:
+                It's possible for this value to be False for a promo code that
+                still reduces a badge's price to zero. If there are some other
+                discounts that also reduce a badge price (like an age discount)
+                then the price may be pushed down to zero.
+
+        is_expired (bool): True if this promo code is expired, False otherwise.
+        is_unlimited (bool): True if this promo code may be used an unlimited
+            number of times, False otherwise.
+        is_valid (bool): True if this promo code is still valid and may be
+            used again, False otherwise.
+        normalized_code (str): A normalized version of `code` suitable for
+            database queries. Normalization converts `code` to all lowercase
+            and removes dashes ("-").
+        used_by (list): List of attendees that have used this promo code.
+
+            Note:
+                This property is declared as a backref in the Attendee class.
+
+        uses_allowed (int): The total number of times this promo code may be
+            used. A value of None means this promo code may be used an
+            unlimited number of times.
+        uses_allowed_str (str): A human readable description of
+            uses_allowed.
+        uses_count (int): The number of times this promo code has already
+            been used.
+        uses_count_str (str): A human readable description of uses_count.
+        uses_remaining (int): Remaining number of times this promo code may
+            be used.
+        uses_remaining_str (str): A human readable description of
+            uses_remaining.
+    """
+
+    FIXED_DISCOUNT = 0
+    FIXED_PRICE = 1
+    PERCENT_DISCOUNT = 2
+    DISCOUNT_TYPE_OPTS = [
+        (FIXED_DISCOUNT, 'Fixed Discount'),
+        (FIXED_PRICE, 'Fixed Price'),
+        (PERCENT_DISCOUNT, 'Percent Discount')]
+
+    AMBIGUOUS_CHARS = {
+        '0': 'OQD',
+        '1': 'IL',
+        '2': 'Z',
+        '5': 'S',
+        '6': 'G',
+        '8': 'B'}
+
+    UNAMBIGUOUS_CHARS = string.digits + string.ascii_uppercase
+    for _, s in AMBIGUOUS_CHARS.items():
+        UNAMBIGUOUS_CHARS = re.sub('[{}]'.format(s), '', UNAMBIGUOUS_CHARS)
+
+    code = Column(UnicodeText)
+    discount = Column(Integer, nullable=True, default=None)
+    discount_type = Column(Choice(DISCOUNT_TYPE_OPTS), default=FIXED_DISCOUNT)
+    expiration_date = Column(UTCDateTime, default=c.ESCHATON)
+    uses_allowed = Column(Integer, nullable=True, default=None)
+
+    __table_args__ = (
+        Index('uq_promo_code_normalized_code',
+            func.replace(func.replace(func.lower(code), '-', ''), ' ', ''),
+            unique=True),
+        CheckConstraint(func.trim(code) != '',
+            name='ck_promo_code_non_empty_code'))
+
+    _repr_attr_names = ('code',)
+
+    @property
+    def discount_str(self):
+        if not self.discount:
+            return 'Free badge'
+
+        if self.discount_type == self.FIXED_DISCOUNT:
+            return '${} discount'.format(self.discount)
+        elif self.discount_type == self.FIXED_PRICE:
+            return '${} badge'.format(self.discount)
+        else:
+            return '%{} discount'.format(self.discount)
+
+    @hybrid_property
+    def is_expired(self):
+        return self.expiration_date < localized_now()
+
+    @is_expired.expression
+    def is_expired(cls):
+        return cls.expiration_date < localized_now()
+
+    @property
+    def is_free(self):
+        return not self.discount or (
+                self.discount_type == self.PERCENT_DISCOUNT and
+                self.discount >= 100
+            ) or (
+                self.discount_type == self.FIXED_DISCOUNT and
+                self.discount >= c.BADGE_PRICE)
+
+    @hybrid_property
+    def is_unlimited(self):
+        return not self.uses_allowed
+
+    @is_unlimited.expression
+    def is_unlimited(cls):
+        return cls.uses_allowed == None
+
+    @hybrid_property
+    def is_valid(self):
+        return not self.is_expired and (
+            self.is_unlimited or self.uses_remaining > 0)
+
+    @is_valid.expression
+    def is_valid(cls):
+        return (cls.expiration_date >= localized_now()) & (
+            (cls.uses_allowed == None) | (cls.uses_remaining > 0))
+
+    @hybrid_property
+    def normalized_code(self):
+        return self.normalize_code(code)
+
+    @normalized_code.expression
+    def normalized_code(cls):
+        return func.replace(
+            func.replace(func.lower(cls.code), '-', ''), ' ', '')
+
+    @property
+    def uses_allowed_str(self):
+        uses = self.uses_allowed
+        return 'Unlimited uses' if uses is None \
+            else '{} use{} allowed'.format(uses, '' if uses == 1 else 's')
+
+    @hybrid_property
+    def uses_count(self):
+        return len(self.used_by)
+
+    @uses_count.expression
+    def uses_count(cls):
+        return select([func.count(Attendee.id)]).where(
+            Attendee.promo_code_id == cls.id).label('uses_count')
+
+    @property
+    def uses_count_str(self):
+        uses = self.uses_count
+        return 'Used by {} attendee{}'.format(uses, '' if uses == 1 else 's')
+
+    @hybrid_property
+    def uses_remaining(self):
+        return None if self.is_unlimited else \
+            self.uses_allowed - self.uses_count
+
+    @uses_remaining.expression
+    def uses_remaining(cls):
+        return cls.uses_allowed - cls.uses_count
+
+    @property
+    def uses_remaining_str(self):
+        uses = self.uses_remaining
+        return 'Unlimited uses' if uses is None \
+            else '{} use{} remaining'.format(uses, '' if uses == 1 else 's')
+
+    @presave_adjustment
+    def _attribute_adjustments(self):
+        # If 'uses_allowed' is empty, then this is an unlimited use code
+        if not self.uses_allowed:
+            self.uses_allowed = None
+
+        # If 'discount' is empty, then this is a full discount, free badge
+        if not self.discount:
+            self.discount = None
+
+        self.code = self.code.strip() if self.code else ''
+        if not self.code:
+            # If 'code' is empty, then generate a random code
+            self.code = self.generate_random_code()
+        else:
+            # Replace multiple whitespace characters with a single space
+            self.code = re.sub(r'\s+', ' ', self.code)
+
+    def calculate_discounted_price(self, price):
+        """
+        Returns the discounted price based on the promo code's `discount_type`.
+
+        Args:
+            price (int): The badge price in whole dollars.
+
+        Returns:
+            int: The discounted price. The returned number will never be
+                less than zero or greater than `price`. If `price` is None
+                or a negative number, then the return value will always be 0.
+        """
+        if not self.discount or not price or price < 0:
+            return 0
+
+        discounted_price = price
+        if self.discount_type == self.FIXED_DISCOUNT:
+            discounted_price = price - self.discount
+        elif self.discount_type == self.FIXED_PRICE:
+            discounted_price = self.discount
+        elif self.discount_type == self.PERCENT_DISCOUNT:
+            discounted_price = int(price * ((100.0 - self.discount) / 100.0))
+
+        return min(max(discounted_price, 0), price)
+
+    @classmethod
+    def _generate_code(cls, generator, count=None):
+        """
+        Helper method to limit collisions for the other generate() methods.
+
+        Arguments:
+            generator (callable): Function that returns a newly generated code.
+            count (int): The number of codes to generate. If `count` is `None`,
+                then a single code will be generated. Defaults to `None`.
+
+        Returns:
+            If an `int` value was passed for `count`, then a `list` of newly
+            generated codes is returned. If `count` is `None`, then a single
+            `str` is returned.
+        """
+        with Session() as session:
+            # Kind of inefficient, but doing one big query for all the existing
+            # codes will be faster than a separate query for each new code.
+            old_codes = set(s for (s,) in session.query(cls.code).all())
+
+        # Set an upper limit on the number of collisions we'll allow,
+        # otherwise this loop could potentially run forever.
+        max_collisions = 100
+        collisions = 0
+        codes = set()
+        while len(codes) < (1 if count is None else count):
+            code = generator().strip()
+            if not code:
+                break
+            if code in codes or code in old_codes:
+                collisions += 1
+                if collisions >= max_collisions:
+                    break
+            else:
+                codes.add(code)
+        return (codes.pop() if codes else None) if count is None else codes
+
+    @classmethod
+    def generate_random_code(cls, count=None, length=9, segment_length=3):
+        """
+        Generates a random promo code.
+
+        With `length` = 12 and `segment_length` = 3::
+
+            XXX-XXX-XXX-XXX
+
+        With `length` = 6 and `segment_length` = 2::
+
+            XX-XX-XX
+
+        Arguments:
+            count (int): The number of codes to generate. If `count` is `None`,
+                then a single code will be generated. Defaults to `None`.
+            length (int): The number of characters to use for the code.
+            segment_length (int): The length of each segment within the code.
+
+        Returns:
+            If an `int` value was passed for `count`, then a `list` of newly
+            generated codes is returned. If `count` is `None`, then a single
+            `str` is returned.
+        """
+
+        # The actual generator function, called repeatedly by `_generate_code`
+        def _generate_random_code():
+            letters = ''.join(
+                random.choice(cls.UNAMBIGUOUS_CHARS) for _ in range(length))
+            return '-'.join(textwrap.wrap(letters, segment_length))
+
+        return cls._generate_code(_generate_random_code, count=count)
+
+    @classmethod
+    def generate_word_code(cls, count=None):
+        """
+        Generates a promo code consisting of words from `PromoCodeWord`.
+
+        Arguments:
+            count (int): The number of codes to generate. If `count` is `None`,
+                then a single code will be generated. Defaults to `None`.
+
+        Returns:
+            If an `int` value was passed for `count`, then a `list` of newly
+            generated codes is returned. If `count` is `None`, then a single
+            `str` is returned.
+        """
+        with Session() as session:
+            words = PromoCodeWord.group_by_parts_of_speech(
+                session.query(PromoCodeWord).order_by(
+                    PromoCodeWord.normalized_word).all())
+
+        # The actual generator function, called repeatedly by `_generate_code`
+        def _generate_word_code():
+            code_words = []
+            for part_of_speech, _ in PromoCodeWord.PART_OF_SPEECH_OPTS:
+                if words[part_of_speech]:
+                    code_words.append(random.choice(words[part_of_speech]))
+            return ' '.join(code_words)
+
+        return cls._generate_code(_generate_word_code, count=count)
+
+    @classmethod
+    def disambiguate_code(cls, code):
+        """
+        Removes ambiguous characters in a promo code supplied by an attendee.
+
+        Arguments:
+            code (str): A promo code as typed by an attendee.
+
+        Returns:
+            str: A copy of `code` with all ambiguous characters replaced by
+                their unambiguous equivalent.
+        """
+        code = cls.normalize_code(code)
+        if not code:
+            return ''
+        for unambiguous, ambiguous in cls.AMBIGUOUS_CHARS.items():
+            ambiguous_pattern = '[{}]'.format(ambiguous.lower())
+            code = re.sub(ambiguous_pattern, unambiguous.lower(), code)
+        return code
+
+    @classmethod
+    def normalize_code(cls, code):
+        """
+        Normalizes a promo code supplied by an attendee.
+
+        Arguments:
+            code (str): A promo code as typed by an attendee.
+
+        Returns:
+            str: A copy of `code` converted to all lowercase, with dashes ("-")
+                and whitespace characters removed.
+        """
+        if not code:
+            return ''
+        return re.sub(r'[\s\-]+', '', code.lower())
+
+c.PROMO_CODE_DISCOUNT_TYPE_OPTS = PromoCode.DISCOUNT_TYPE_OPTS
 
 
 class WatchList(MagModel):
@@ -1813,7 +2544,7 @@ class Job(MagModel):
 
     @property
     def capable_volunteers_opts(self):
-        # format output for use with the {% options %} template decorator
+        # format output for use with the {{ options() }} template decorator
         return [(a.id, a.full_name) for a in self.capable_volunteers]
 
     @property
@@ -1883,6 +2614,17 @@ class ArbitraryCharge(MagModel):
     _repr_attr_names = ['what']
 
 
+class StripeTransaction(MagModel):
+    stripe_id = Column(UnicodeText, nullable=True)
+    type = Column(Choice(c.TRANSACTION_TYPE_OPTS), default=c.PAYMENT)
+    amount = Column(Integer)
+    when = Column(UTCDateTime, default=lambda: datetime.now(UTC))
+    who = Column(UnicodeText)
+    desc = Column(UnicodeText)
+    fk_id = Column(UUID)
+    fk_model = Column(UnicodeText)
+
+
 class ApprovedEmail(MagModel):
     ident = Column(UnicodeText)
 
@@ -1921,9 +2663,9 @@ class Email(MagModel):
     @property
     def html(self):
         if self.is_html:
-            return SafeString(re.split('<body[^>]*>', self.body)[1].split('</body>')[0])
+            return safe_string(re.split('<body[^>]*>', self.body)[1].split('</body>')[0])
         else:
-            return SafeString(self.body.replace('\n', '<br/>'))
+            return safe_string(self.body.replace('\n', '<br/>'))
 
 
 class PageViewTracking(MagModel):
@@ -2152,9 +2894,9 @@ def register_session_listeners():
 register_session_listeners()
 
 
-def initialize_db():
+def initialize_db(modify_tables=False):
     """
-    Initialize the database on startup
+    Initialize the session on startup
 
     We want to do this only after all other plugins have had a chance to initialize
     and add their 'mixin' data (i.e. extra colums) into the models.
@@ -2163,7 +2905,8 @@ def initialize_db():
     if this fails, keep trying until we're able to connect.
 
     This should be the ONLY spot (except for maintenance tools) in all of core ubersystem or any plugins
-    that attempts to create tables by passing modify_tables=True to Session.initialize_db()
+    that attempts to create tables by passing drop=True or modify_tables=True or initialize=True to
+    Session.initialize_db()
     """
     for _model in Session.all_models():
         setattr(Session.SessionMixin, _model.__tablename__, _make_getter(_model))
@@ -2171,7 +2914,7 @@ def initialize_db():
     num_tries_remaining = 10
     while not stopped.is_set():
         try:
-            Session.initialize_db(modify_tables=True)
+            Session.initialize_db(modify_tables=modify_tables, initialize=True)
         except KeyboardInterrupt:
             log.critical('DB initialize: Someone hit Ctrl+C while we were starting up')
         except:

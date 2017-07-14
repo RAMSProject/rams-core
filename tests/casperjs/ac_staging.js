@@ -5,17 +5,17 @@
 var chance = require('./import_chance.js').Chance(Math.random);
 var clientutils = require('clientutils');
 
+casper.options.timeout = 30000;
+
 // first we generate our test info
 myAttendeeInfo = {
   'first_name'         : chance.first(),
   'last_name'          : chance.last(),
   'email'              : chance.email(),
-  'badge_printed_name' : chance.name(),
+  'badge_printed_name' : chance.word({syllables: chance.natural({min: 2, max: 8})}),
   'cellphone'          : chance.phone(),
   'ec_name'            : chance.name(),
   'ec_phone'           : chance.phone(),
-  'found_how'          : chance.word(),
-  'comments'           : chance.sentence(),
   'address1'           : chance.address(),
   'address2'           : chance.sentence({words: 2}),
   'city'               : chance.city(),
@@ -25,19 +25,19 @@ myAttendeeInfo = {
 }
 
 casper.test.begin('Adding a regular registration to the cart is successful', 10, function suite(test) {
-    casper.start('http://localhost:8282/magfest/preregistration/form', function() {
+    casper.start('https://staging.reg.anthrocon.org/anthrocon/preregistration/form', function() {
         //this.echo(this.getCurrentUrl());
-        test.assertTitle("MAGFest - Preregistration", "preregistration title is as expected");
-        test.assertExists('form[action="form"]', "main form is found");
-        this.fill('form[action="form"]', myAttendeeInfo, false);
+        test.assertTitle("Anthrocon - Preregistration", "preregistration title is as expected");
+        test.assertExists('form[action="post_form"]', "main form is found");
+        this.fill('form[action="post_form"]', myAttendeeInfo, false);
         //these 3 type in the birthdate
         //FIXME: XPath here is fragile, find a better selector to use
-        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[15]/div/span/span[1]/input[1]'},'1');
-        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[15]/div/span/span[1]/input[2]'},'1');
-        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[15]/div/span/span[1]/input[3]'},'1990');
+        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[12]/div/span/span[1]/input[1]'},'1');
+        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[12]/div/span/span[1]/input[2]'},'1');
+        this.sendKeys({type: 'xpath', path: '//*[@id="mainContainer"]/div[3]/form/div[12]/div/span/span[1]/input[3]'},'1990');
         //FIXME: we don't currently test the autocomplete of addresses
         //casper.evaluate(function() {
-        //  __utils__.echo(JSON.stringify(__utils__.getFormValues('form[action="form"]')), null, 4);
+        //  __utils__.echo(JSON.stringify(__utils__.getFormValues('form[action="post_form"]')), null, 4);
         //});
         this.click('button[value=Preregister]');
     });
@@ -46,9 +46,9 @@ casper.test.begin('Adding a regular registration to the cart is successful', 10,
         test.assertUrlMatch(/index$/, 'shopping cart displayed');
         test.assertExists('.stripe-button-el','stripe button present');
         test.assertSelectorHasText('.footable-visible', myAttendeeInfo.first_name + ' ' + myAttendeeInfo.last_name, 'Name matches')
-        test.assertSelectorHasText('.footable-visible', '$60', 'Price is correct');
+        test.assertSelectorHasText('.footable-visible', '$50', 'Price is correct');
         this.click('button.stripe-button-el');
-        this.wait(500);
+        this.wait(10000);
     });
     casper.withFrame(0, function() {
       test.assertTitle("Stripe Checkout", "Stripe Checkout popup loaded");
@@ -70,7 +70,7 @@ casper.test.begin('Adding a regular registration to the cart is successful', 10,
       //FIXME: Add test of confirm link
       },function(){
         this.die('Failed to load confirm screen, URL is: ' + this.getCurrentUrl())
-      }, 30000);
+      }, 90000);
     casper.run(function() {
         test.done();
     });
