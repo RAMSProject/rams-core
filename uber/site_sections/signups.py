@@ -1,4 +1,5 @@
 from uber.common import *
+from uber.custom_tags import safe_string
 
 
 @all_renderable(c.SIGNUPS)
@@ -68,12 +69,26 @@ class Root:
         }
 
     @check_shutdown
-    def shifts(self, session, tgt_date='', state=''):
+    def shifts(self, session, view='', start=''):
         joblist = session.jobs_for_signups()
+        con_days = -(-c.CON_LENGTH // 24)  # Equivalent to ceil(c.CON_LENGTH / 24)
+
+        if session.logged_in_volunteer().can_work_setup and session.logged_in_volunteer().can_work_teardown:
+            cal_length = c.CON_TOTAL_LENGTH
+        elif session.logged_in_volunteer().can_work_setup:
+            cal_length = con_days + c.SETUP_SHIFT_DAYS
+        elif session.logged_in_volunteer().can_work_teardown:
+            cal_length = con_days + 2  # There's no specific config for # of shift signup days
+        else:
+            cal_length = con_days
         return {
             'jobs': joblist,
             'name': session.logged_in_volunteer().full_name,
-            'hours': session.logged_in_volunteer().weighted_hours
+            'hours': session.logged_in_volunteer().weighted_hours,
+            'view': view,
+            'start': start,
+            'start_day': c.SHIFTS_START_DAY if session.logged_in_volunteer().can_work_setup else c.EPOCH,
+            'cal_length': cal_length
         }
 
     @check_shutdown
@@ -109,9 +124,9 @@ class Root:
             try:
                 attendee = session.lookup_attendee(first_name.strip(), last_name.strip(), email, zip_code)
                 if not attendee.staffing:
-                    message = SafeString('You are not signed up as a volunteer.  <a href="volunteer?id={}">Click Here</a> to sign up.'.format(attendee.id))
+                    message = safe_string('You are not signed up as a volunteer.  <a href="volunteer?id={}">Click Here</a> to sign up.'.format(attendee.id))
                 elif not attendee.assigned_depts_ints and not c.AT_THE_CON:
-                    message = 'You have not been assigned to any departmemts; an admin must assign you to a department before you can log in'
+                    message = 'You have not been assigned to any departments; an admin must assign you to a department before you can log in'
             except:
                 message = 'No attendee matches that name and email address and zip code'
 

@@ -38,14 +38,25 @@ cherrypy.tools.custom_verbose_logger = cherrypy.Tool('before_error_response', lo
 
 
 class StaticViews:
-    def path_args_to_string(self, path_args):
+    @classmethod
+    def path_args_to_string(cls, path_args):
         return '/'.join(path_args)
 
-    def get_full_path_from_path_args(self, path_args):
-        return 'static_views/' + self.path_args_to_string(path_args)
+    @classmethod
+    def get_full_path_from_path_args(cls, path_args):
+        return 'static_views/' + cls.path_args_to_string(path_args)
 
-    def get_filename_from_path_args(self, path_args):
+    @classmethod
+    def get_filename_from_path_args(cls, path_args):
         return path_args[-1]
+
+    @classmethod
+    def raise_not_found(cls, path, e=None):
+        raise cherrypy.HTTPError(404, "The path '{}' was not found.".format(path)) from e
+
+    @cherrypy.expose
+    def index(self):
+        self.raise_not_found('static_views/')
 
     @cherrypy.expose
     def default(self, *path_args, **kwargs):
@@ -54,8 +65,8 @@ class StaticViews:
         template_name = self.get_full_path_from_path_args(path_args)
         try:
             content = render(template_name)
-        except django.template.base.TemplateDoesNotExist as e:
-            raise cherrypy.HTTPError(404, "Couldn't find {}".format(template_name)) from e
+        except jinja2.exceptions.TemplateNotFound as e:
+            self.raise_not_found(template_name, e)
 
         guessed_content_type = mimetypes.guess_type(content_filename)[0]
         return cherrypy.lib.static.serve_fileobj(content, name=content_filename, content_type=guessed_content_type)
@@ -98,14 +109,26 @@ class Root:
 
 mount_site_sections(c.MODULE_ROOT)
 
+
+def error_page_404(status, message, traceback, version):
+    return "Sorry, page not found!<br/><br/>{}<br/>{}".format(status, message)
+
+c.APPCONF['/']['error_page.404'] = error_page_404
+
 cherrypy.tree.mount(Root(), c.PATH, c.APPCONF)
 static_overrides(join(c.MODULE_ROOT, 'static'))
 
-DaemonTask(check_unassigned, interval=300,          name="mail unassg")
-DaemonTask(detect_duplicates, interval=300,         name="mail dupes")
-DaemonTask(check_placeholders, interval=300,        name="mail placeh")
 
-DaemonTask(SendAllAutomatedEmailsJob.send_all_emails, interval=300,   name="send emails")
+def reg_checks():
+    sleep(600)  # Delay by 10 minutes to give the system time to start up
+    check_unassigned()
+    detect_duplicates()
+    check_placeholders()
+
+# Registration checks are run every six hours
+DaemonTask(reg_checks, interval=21600, name="mail reg checks")
+
+DaemonTask(SendAllAutomatedEmailsJob.send_all_emails, interval=300, name="send emails")
 
 # TODO: this should be replaced by something a little cleaner, but it can be a useful debugging tool
 # DaemonTask(lambda: log.error(Session.engine.pool.status()), interval=5)

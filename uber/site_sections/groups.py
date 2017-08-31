@@ -32,7 +32,7 @@ class Root:
 
     @log_pageview
     def form(self, session, new_dealer='', first_name='', last_name='', email='', message='', **params):
-        group = session.group(params, checkgroups=Group.all_checkgroups, bools=Group.all_bools,)
+        group = session.group(params, checkgroups=Group.all_checkgroups, bools=Group.all_bools)
         if 'name' in params:
             message = check(group)
             if not message:
@@ -70,7 +70,7 @@ class Root:
 
         if group.leader:
             emails = session.query(Email)\
-                .filter(or_(Email.dest == group.leader.email, and_(Email.model == 'Attendee', Email.fk_id == id)))\
+                .filter(or_(Email.dest == group.leader.email, Email.fk_id == id))\
                 .order_by(Email.when).all()
         else:
             emails = {}
@@ -103,7 +103,7 @@ class Root:
                     message = 'Group declined and emails sent to attendees'
                     attendee.paid = c.NOT_PAID
                     attendee.badge_status = c.NEW_STATUS
-                    attendee.ribbon = c.NO_RIBBON
+                    attendee.ribbon = remove_opt(attendee.ribbon_ints, c.DEALER_RIBBON)
                     try:
                         send_email(c.REGDESK_EMAIL, attendee.email, 'Do you still want to come to {EVENT_NAME}?',
                                    render('emails/dealers/badge_converted.html', {

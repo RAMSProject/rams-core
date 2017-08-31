@@ -113,7 +113,7 @@ class Config(_Overridable):
             # Only check bucket-based pricing if we're not checking an existing badge AND
             # we don't have hardcore_optimizations_enabled config on AND we're not on-site
             # (because on-site pricing doesn't involve checking badges sold).
-            if not dt and not c.HARDCORE_OPTIMIZATIONS_ENABLED and sa.localized_now() < c.EPOCH:
+            if not dt and not self.HARDCORE_OPTIMIZATIONS_ENABLED and sa.localized_now() < c.EPOCH:
                 badges_sold = self.BADGES_SOLD
 
                 for badge_cap, bumped_price in sorted(self.PRICE_LIMITS.items()):
@@ -137,6 +137,16 @@ class Config(_Overridable):
     def DEALER_REG_OPEN(self):
         return self.AFTER_DEALER_REG_START and self.BEFORE_DEALER_REG_SHUTDOWN
 
+    @property
+    def DEALER_REG_SOFT_CLOSED(self):
+        return self.AFTER_DEALER_REG_DEADLINE or self.DEALER_APPS >= self.MAX_DEALER_APPS \
+            if self.MAX_DEALER_APPS and not self.HARDCORE_OPTIMIZATIONS_ENABLED else self.AFTER_DEALER_REG_DEADLINE
+
+    @request_cached_property
+    def DEALER_APPS(self):
+        with sa.Session() as session:
+            return session.query(sa.Group).filter(sa.Group.tables > 0, sa.Group.cost > 0, sa.Group.status == self.UNAPPROVED).count()
+
     @request_cached_property
     def BADGES_SOLD(self):
         with sa.Session() as session:
@@ -145,6 +155,27 @@ class Config(_Overridable):
             group_badges = attendees.join(sa.Attendee.group).filter(sa.Attendee.paid == self.PAID_BY_GROUP,
                                                                     sa.Group.amount_paid > 0).count()
             return individuals + group_badges
+
+    @request_cached_property
+    def BADGES_LEFT_AT_CURRENT_PRICE(self):
+        """
+        Returns a string representing a rough estimate of how many badges are left at the current badge price tier.
+        """
+        if c.HARDCORE_OPTIMIZATIONS_ENABLED:
+            return None
+
+        current_price_tier = c.ORDERED_PRICE_LIMITS.index(c.BADGE_PRICE) if c.BADGE_PRICE in c.ORDERED_PRICE_LIMITS else -1
+        if current_price_tier != -1 and c.ORDERED_PRICE_LIMITS[current_price_tier] == c.ORDERED_PRICE_LIMITS[-1]\
+                or not c.ORDERED_PRICE_LIMITS:
+            if c.MAX_BADGE_SALES:
+                difference = c.MAX_BADGE_SALES - c.BADGES_SOLD
+            else:
+                return -1
+        else:
+            for key, val in c.PRICE_LIMITS.items():
+                if c.ORDERED_PRICE_LIMITS[current_price_tier+1] == val:
+                    difference = key - c.BADGES_SOLD
+        return difference
 
     @property
     def ONEDAY_BADGE_PRICE(self):
@@ -163,6 +194,9 @@ class Config(_Overridable):
         types = [self.ATTENDEE_BADGE, self.PSEUDO_DEALER_BADGE]
         for reg_open, badge_type in [(self.BEFORE_GROUP_PREREG_TAKEDOWN, self.PSEUDO_GROUP_BADGE)]:
             if reg_open:
+                types.append(badge_type)
+        for badge_type in self.BADGE_TYPE_PRICES:
+            if badge_type not in types:
                 types.append(badge_type)
         return types
 
@@ -220,6 +254,41 @@ class Config(_Overridable):
         return dict(self.PREREG_DONATION_OPTS)
 
     @property
+    def PREREG_REQUEST_HOTEL_INFO_DEADLINE(self):
+        """
+        The datetime at which the "Request Hotel Info" checkbox will NO LONGER
+        be shown during preregistration.
+        """
+        return self.PREREG_OPEN + timedelta(
+            hours=max(0, self.PREREG_REQUEST_HOTEL_INFO_DURATION))
+
+    @property
+    def PREREG_REQUEST_HOTEL_INFO_ENABLED(self):
+        """
+        Boolean which indicates whether the "Request Hotel Info" checkbox is
+        enabled generally, whether or not the deadline has passed.
+        """
+        return self.PREREG_REQUEST_HOTEL_INFO_DURATION > 0
+
+    @property
+    def PREREG_REQUEST_HOTEL_INFO_OPEN(self):
+        """
+        Boolean which indicates whether the "Request Hotel Info" checkbox is
+        enabled and currently open with preregistration.
+        """
+        if not self.PREREG_REQUEST_HOTEL_INFO_ENABLED:
+            return False
+        return not self.AFTER_PREREG_REQUEST_HOTEL_INFO_DEADLINE
+
+    @property
+    def PREREG_HOTEL_INFO_EMAIL_DATE(self):
+        """
+        Date at which the hotel booking link email becomes available to send.
+        """
+        return self.PREREG_REQUEST_HOTEL_INFO_DEADLINE + \
+            timedelta(hours=max(0, self.PREREG_HOTEL_INFO_EMAIL_WAIT_DURATION))
+
+    @property
     def AT_THE_DOOR_BADGE_OPTS(self):
         """
         This provides the dropdown on the /registration/register page with its
@@ -231,6 +300,9 @@ class Config(_Overridable):
         opts = []
         if self.ATTENDEE_BADGE_AVAILABLE:
             opts.append((self.ATTENDEE_BADGE, 'Full Weekend Pass (${})'.format(self.BADGE_PRICE)))
+        for badge_type in self.BADGE_TYPE_PRICES:
+            if badge_type not in opts:
+                opts.append((badge_type, '{} (${})'.format(self.BADGES[badge_type], self.BADGE_TYPE_PRICES[badge_type])))
         if self.ONE_DAYS_ENABLED:
             if self.PRESELL_ONE_DAYS:
                 day = max(sa.localized_now(), self.EPOCH)
@@ -256,6 +328,17 @@ class Config(_Overridable):
     @property
     def PRE_CON(self):
         return not self.AT_OR_POST_CON
+
+    @property
+    def STAFF_GET_FOOD(self):
+        """
+        Certain events may run a complimentary consuite for staff and guests. Whether or not the consuite exists changes
+        a lot of little things, like whether we collect food restrictions or describe free food as a benefit to
+        staffing. To turn this on, add a department with the variable name `food_prep` to [[job_location]].
+        Returns:
+            Boolean: true if `food_prep` is defined in [[job_location]] config
+        """
+        return getattr(c, 'FOOD_PREP', None) in c.JOB_LOCATIONS
 
     @property
     def FINAL_EMAIL_DEADLINE(self):
@@ -287,7 +370,7 @@ class Config(_Overridable):
 
     @property
     def HTTP_METHOD(self):
-        return cherrypy.request.method
+        return cherrypy.request.method.upper()
 
     def get_kickin_count(self, kickin_level):
         with sa.Session() as session:
@@ -347,11 +430,15 @@ class Config(_Overridable):
         elif name.endswith('_AVAILABLE'):
             item_check = name.rsplit('_', 1)[0]
             stock_setting = getattr(self, item_check + '_STOCK', None)
+            if stock_setting is None:
+                # Defaults to unlimited stock for any stock not configured
+                return True
+
+            # Only poll the DB if stock is configured
             count_check = getattr(self, item_check + '_COUNT', None)
             if count_check is None:
-                return False  # Things with no count are never considered available
-            elif stock_setting is None:
-                return True  # Defaults to unlimited stock for any stock not configured
+                # Things with no count are never considered available
+                return False
             else:
                 return int(count_check) < int(stock_setting)
         elif hasattr(_secret, name):
@@ -386,8 +473,6 @@ c = Config()
 _secret = SecretConfig()
 
 _config = parse_config(__file__)  # outside this module, we use the above c global instead of using this directly
-
-django.conf.settings.configure(**_config['django'].dict())
 
 
 def _unrepr(d):
@@ -430,6 +515,7 @@ for _opt, _val in c.BADGE_PRICES['attendee'].items():
         c.PRICE_LIMITS[int(_opt)] = _val
     else:
         c.PRICE_BUMPS[date] = _val
+c.ORDERED_PRICE_LIMITS = sorted([val for key, val in c.PRICE_LIMITS.items()])
 
 
 def _is_intstr(s):
@@ -472,6 +558,13 @@ c.BADGE_RANGES = {}
 for _badge_type, _range in _config['badge_ranges'].items():
     c.BADGE_RANGES[getattr(c, _badge_type.upper())] = _range
 
+c.BADGE_TYPE_PRICES = {}
+for _badge_type, _price in _config['badge_type_prices'].items():
+    try:
+        c.BADGE_TYPE_PRICES[getattr(c, _badge_type.upper())] = _price
+    except AttributeError:
+        pass
+
 c.make_enum('age_group', OrderedDict([(name, section['desc']) for name, section in _config['age_groups'].items()]))
 c.AGE_GROUP_CONFIGS = {}
 for _name, _section in _config['age_groups'].items():
@@ -490,6 +583,7 @@ c.TRANSFERABLE_BADGE_TYPES = [getattr(c, badge_type.upper()) for badge_type in c
 c.DEPT_HEAD_CHECKLIST = _config['dept_head_checklist']
 
 c.BADGE_LOCK = RLock()
+c.ASSIGN_ATTENDEE_TO_GROUP_LOCK = RLock()
 
 c.CON_LENGTH = int((c.ESCHATON - c.EPOCH).total_seconds() // 3600)
 c.START_TIME_OPTS = [(dt, dt.strftime('%I %p %a')) for dt in (c.EPOCH + timedelta(hours=i) for i in range(c.CON_LENGTH))]
@@ -511,6 +605,7 @@ c.EVENT_YEAR = c.EPOCH.strftime('%Y')
 c.EVENT_MONTH = c.EPOCH.strftime('%B')
 c.EVENT_START_DAY = int(c.EPOCH.strftime('%d')) % 100
 c.EVENT_END_DAY = int(c.ESCHATON.strftime('%d')) % 100
+c.SHIFTS_START_DAY = c.EPOCH - timedelta(days=c.SETUP_SHIFT_DAYS)
 
 c.DAYS = sorted({(dt.strftime('%Y-%m-%d'), dt.strftime('%a')) for dt, desc in c.START_TIME_OPTS})
 c.HOURS = ['{:02}'.format(i) for i in range(24)]
@@ -560,6 +655,7 @@ c.FEE_ITEM_NAMES = [desc for val, desc in c.FEE_PRICE_OPTS]
 c.WRISTBAND_COLORS = defaultdict(lambda: c.WRISTBAND_COLORS[c.DEFAULT_WRISTBAND], c.WRISTBAND_COLORS)
 
 c.SAME_NUMBER_REPEATED = r'^(\d)\1+$'
+c.INVALID_BADGE_PRINTED_CHARS = r'[^a-zA-Z0-9!"#$%&\'()*+,\-\./:;<=>?@\[\\\]^_`\{|\}~ "]'  # Allows 0-9, a-z, A-Z, and a handful of punctuation characters
 c.EVENT_QR_ID = c.EVENT_QR_ID or c.EVENT_NAME_AND_YEAR.replace(' ', '_').lower()
 
 try:
