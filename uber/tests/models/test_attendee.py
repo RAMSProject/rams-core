@@ -1,4 +1,6 @@
+from uber import config
 from uber.tests import *
+from uber.model_checks import extra_donation_valid
 
 
 class TestCosts:
@@ -13,6 +15,7 @@ class TestCosts:
         assert 30 == Attendee(overridden_price=30).badge_cost
         assert 0 == Attendee(paid=c.NEED_NOT_PAY).badge_cost
         assert 20 == Attendee(paid=c.PAID_BY_GROUP).badge_cost
+        assert 30 == Attendee(base_badge_price=30).badge_cost
 
     def test_total_cost(self):
         assert 20 == Attendee().total_cost
@@ -62,6 +65,7 @@ def test_is_dealer():
     # not all attendees in a dealer group are necessarily dealers
     dealer_group = Group(tables=1)
     assert not Attendee(group=dealer_group).is_dealer
+    assert Attendee(group=dealer_group, paid=c.PAID_BY_GROUP).is_dealer
 
 
 def test_is_dept_head():
@@ -86,6 +90,18 @@ def test_last_first(monkeypatch):
     assert 'y, x' == Attendee(first_name='x', last_name='y').last_first
     monkeypatch.setattr(Attendee, 'unassigned_name', 'xxx')
     assert 'xxx' == Attendee(first_name='x', last_name='y').last_first
+
+
+def test_legal_name_same_as_full_name():
+    same_legal_name = Attendee(first_name='First', last_name='Last', legal_name='First Last')
+    same_legal_name._misc_adjustments()
+    assert '' == same_legal_name.legal_name
+
+
+def test_legal_name_diff_from_full_name():
+    diff_legal_name = Attendee(first_name='first', last_name='last', legal_name='diff name')
+    diff_legal_name._misc_adjustments()
+    assert 'diff name' == diff_legal_name.legal_name
 
 
 def test_badge():
@@ -136,16 +152,53 @@ def test_takes_shifts():
     assert Attendee(staffing=True, assigned_depts=','.join(map(str, [c.CONSOLE, c.CON_OPS]))).takes_shifts
 
 
+class TestAttendeeFoodRestrictionsFilledOut:
+    @pytest.fixture
+    def staff_get_food_true(self, monkeypatch):
+        monkeypatch.setattr(config.Config, 'STAFF_GET_FOOD', property(lambda x: True))
+        assert c.STAFF_GET_FOOD == True
+
+    @pytest.fixture
+    def staff_get_food_false(self, monkeypatch):
+        monkeypatch.setattr(config.Config, 'STAFF_GET_FOOD', property(lambda x: False))
+        assert c.STAFF_GET_FOOD == False
+
+    def test_food_restrictions_filled_out(self, staff_get_food_true):
+        assert Attendee(food_restrictions=FoodRestrictions()).food_restrictions_filled_out
+
+    def test_food_restrictions_not_filled_out(self, staff_get_food_true):
+        assert not Attendee().food_restrictions_filled_out
+
+    def test_food_restrictions_not_needed(self, staff_get_food_false):
+        assert Attendee().food_restrictions_filled_out
+
+    def test_shift_prereqs_complete(self, staff_get_food_true):
+        assert Attendee(placeholder=False, shirt=1, food_restrictions=FoodRestrictions()).shift_prereqs_complete
+
+    def test_shift_prereqs_placeholder(self, staff_get_food_true):
+        assert not Attendee(placeholder=True, shirt=1, food_restrictions=FoodRestrictions()).shift_prereqs_complete
+
+    def test_shift_prereqs_no_shirt(self, staff_get_food_true):
+        assert not Attendee(placeholder=False, shirt=c.NO_SHIRT, food_restrictions=FoodRestrictions()).shift_prereqs_complete
+        assert not Attendee(placeholder=False, shirt=c.SIZE_UNKNOWN, food_restrictions=FoodRestrictions()).shift_prereqs_complete
+
+    def test_shift_prereqs_no_food(self, staff_get_food_true):
+        assert not Attendee(placeholder=False, shirt=1).shift_prereqs_complete
+
+    def test_shift_prereqs_food_not_needed(self, staff_get_food_false):
+        assert Attendee(placeholder=False, shirt=1).shift_prereqs_complete
+
+
 class TestUnsetVolunteer:
     def test_basic(self):
         a = Attendee(staffing=True, trusted_depts=c.CONSOLE, requested_depts=c.CONSOLE, assigned_depts=c.CONSOLE, ribbon=c.VOLUNTEER_RIBBON, shifts=[Shift()])
         a.unset_volunteering()
-        assert not a.staffing and not a.trusted_somewhere and not a.requested_depts and not a.assigned_depts and not a.shifts and a.ribbon == c.NO_RIBBON
+        assert not a.staffing and not a.trusted_somewhere and not a.requested_depts and not a.assigned_depts and not a.shifts and a.ribbon == ''
 
     def test_different_ribbon(self):
         a = Attendee(ribbon=c.DEALER_RIBBON)
         a.unset_volunteering()
-        assert a.ribbon == c.DEALER_RIBBON
+        assert c.DEALER_RIBBON in a.ribbon_ints
 
     def test_staff_badge(self, monkeypatch):
         with Session() as session:
@@ -188,10 +241,14 @@ class TestUnsetVolunteer:
         a._misc_adjustments()
         assert a.checked_in
 
+        a = Attendee(badge_num=1, badge_type=c.PREASSIGNED_BADGE_TYPES[0])
+        a._misc_adjustments()
+        assert not a.checked_in
+
         monkeypatch.setattr(Attendee, 'is_new', False)
         a = Attendee(badge_num=1)
         a._misc_adjustments()
-        assert a.checked_in
+        assert not a.checked_in
 
     def test_names(self):
         a = Attendee(first_name='nac', last_name='mac Feegle')
@@ -260,12 +317,12 @@ class TestStaffingAdjustments:
     def test_staffers_need_no_volunteer_ribbon(self):
         a = Attendee(badge_type=c.STAFF_BADGE, ribbon=c.VOLUNTEER_RIBBON)
         a._staffing_adjustments()
-        assert a.ribbon == c.NO_RIBBON
+        assert a.ribbon == ''
 
     def test_staffers_can_have_other_ribbons(self):
         a = Attendee(badge_type=c.STAFF_BADGE, ribbon=c.DEALER_RIBBON)
         a._staffing_adjustments()
-        assert a.ribbon == c.DEALER_RIBBON
+        assert c.DEALER_RIBBON in a.ribbon_ints
 
     def test_no_to_yes_ribbon(self, unset_volunteering, prevent_presave_adjustments):
         with Session() as session:
@@ -280,13 +337,13 @@ class TestStaffingAdjustments:
             a = session.attendee(first_name='Regular', last_name='Attendee')
             a.staffing = True
             a._staffing_adjustments()
-            assert a.ribbon == c.VOLUNTEER_RIBBON
+            assert a.ribbon_ints == [c.VOLUNTEER_RIBBON]
             assert not unset_volunteering.called
 
     def test_yes_to_no_ribbon(self, unset_volunteering, prevent_presave_adjustments):
         with Session() as session:
             a = session.attendee(first_name='Regular', last_name='Volunteer')
-            a.ribbon = c.NO_RIBBON
+            a.ribbon = ''
             a._staffing_adjustments()
             assert unset_volunteering.called
 
@@ -312,12 +369,12 @@ class TestBadgeAdjustments:
     def test_group_to_attendee(self):
         a = Attendee(badge_type=c.PSEUDO_GROUP_BADGE)
         a._badge_adjustments()
-        assert a.badge_type == c.ATTENDEE_BADGE and a.ribbon == c.NO_RIBBON
+        assert a.badge_type == c.ATTENDEE_BADGE and a.ribbon == ''
 
     def test_dealer_to_attendee(self):
         a = Attendee(badge_type=c.PSEUDO_DEALER_BADGE)
         a._badge_adjustments()
-        assert a.badge_type == c.ATTENDEE_BADGE and a.ribbon == c.DEALER_RIBBON
+        assert a.badge_type == c.ATTENDEE_BADGE and a.ribbon_ints == [c.DEALER_RIBBON]
 
 
 class TestStatusAdjustments:
@@ -408,3 +465,15 @@ class TestLookupAttendee:
         with Session() as session:
             assert session.lookup_attendee('Two First', 'Names', 'searchable@example.com', '12345')
             assert session.lookup_attendee('Two', 'Last Names', 'searchable@example.com', '12345')
+
+
+class TestExtraDonationValidations:
+
+    def test_extra_donation_nan(self):
+        assert "What you entered for Extra Donation (blah) isn't even a number" == extra_donation_valid(Attendee(extra_donation="blah"))
+
+    def test_extra_donation_below_zero(self):
+        assert "Extra Donation must be a number that is 0 or higher." == extra_donation_valid(Attendee(extra_donation=-10))
+
+    def test_extra_donation_valid(self):
+        assert None == extra_donation_valid(Attendee(extra_donation=10))

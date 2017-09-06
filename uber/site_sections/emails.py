@@ -47,6 +47,7 @@ class Root:
         count = 0
         examples = []
         email = AutomatedEmail.instances[ident]
+        example = render_empty('emails/' + email.template)
         for x in AutomatedEmail.queries[email.model](session):
             if email.filters_run(x):
                 count += 1
@@ -55,10 +56,11 @@ class Root:
                     Attendee: '../registration/form?id={}'
                 }.get(x.__class__, '').format(x.id)
                 if len(examples) < 10:
-                    examples.append([url, email.render(x)])
+                    examples.append([url, email.render(x).decode('utf-8')])
 
         return {
             'count': count,
+            'example': example,
             'examples': examples,
             'subject': email.subject,
         }
@@ -85,6 +87,33 @@ class Root:
             'body': body or "ignore this email, <b>it is a test</b> of the <u>RAMS email system</u> " + right_now,
             'message': output_msg,
         }
+
+    @ajax
+    def resend_email(self, session, id):
+        """
+        Resend a particular email to the model's current email address.
+
+        This is useful for if someone had an invalid email address and did not receive an automated email.
+        """
+
+        email = session.email(id)
+        if email:
+            # If this was an automated email, we can send out an updated template with the correct 'from' address
+            if email.ident in AutomatedEmail.instances:
+                email_category = AutomatedEmail.instances[email.ident]
+                sender = email_category.sender
+                body = email_category.render(email.fk)
+            else:
+                sender = c.ADMIN_EMAIL
+                body = email.html
+
+            try:
+                send_email(sender, email.rcpt_email, email.subject, body, model=email.fk, ident=email.ident)
+            except:
+                return {'success': False, 'message': 'Email not sent: unknown error.'}
+            else:
+                return {'success': True, 'message': 'Email resent.'}
+        return {'success': False, 'message': 'Email not sent: no email found with that ID.'}
 
     @csrf_protected
     def approve(self, session, ident):

@@ -1,5 +1,4 @@
 from uber.common import *
-from email_validator import validate_email, EmailNotValidError
 
 
 class CSRFException(Exception):
@@ -110,9 +109,15 @@ def check_csrf(csrf_token):
 
 def check(model, *, prereg=False):
     """
-    Runs all default validations against the supplied model instance.  Returns
-    either a string error message if any validation fails and returns None if
-    all validations passed.
+    Runs all default validations against the supplied model instance.
+
+    Args:
+        model (sqlalchemy.Model): A single model instance.
+        prereg (bool): True if this is an ephemeral model used in the
+            preregistration workflow.
+
+    Returns:
+        str: None for success, or a failure message if any validation fails.
     """
     for field, name in model.required:
         if not str(getattr(model, field)).strip():
@@ -123,6 +128,25 @@ def check(model, *, prereg=False):
             message = validator(model)
             if message:
                 return message
+
+
+def check_all(models, *, prereg=False):
+    """
+    Runs all default validations against multiple model instances.
+
+    Args:
+        models (list): A single model instance or a list of model instances.
+        prereg (bool): True if this is an ephemeral model used in the
+            preregistration workflow.
+
+    Returns:
+        str: None for success, or the first failure message encountered.
+    """
+    models = listify(models) if models else []
+    for model in models:
+        message = check(model, prereg=prereg)
+        if message:
+            return message
 
 
 class Order:
@@ -149,11 +173,12 @@ class Registry:
 class DeptChecklistConf(Registry):
     instances = OrderedDict()
 
-    def __init__(self, slug, description, deadline, name=None, path=None):
+    def __init__(self, slug, description, deadline, name=None, path=None, email_post_con=False):
         assert re.match('^[a-z0-9_]+$', slug), 'Dept Head checklist item sections must have separated_by_underscore names'
         self.slug, self.description = slug, description
         self.name = name or slug.replace('_', ' ').title()
         self._path = path or '/dept_checklist/form?slug={slug}'
+        self.email_post_con = email_post_con
         self.deadline = c.EVENT_TIMEZONE.localize(datetime.strptime(deadline, '%Y-%m-%d')).replace(hour=23, minute=59)
 
     def path(self, attendee):
@@ -216,38 +241,94 @@ def _record_email_sent(email):
 
 
 class Charge:
-    def __init__(self, targets=(), amount=None, description=None):
-        self.targets = [self.to_sessionized(m) for m in listify(targets)]
 
-        # performance optimization
-        self._models_cached = [self.from_sessionized(d) for d in self.targets]
+    def __init__(self, targets=(), amount=None, description=None, receipt_email=None):
+        self._targets = listify(targets)
+        self._amount = amount
+        self._description = description
+        self._receipt_email = receipt_email
 
-        self.amount = amount or self.total_cost
-        self.description = description or self.names
+    @classproperty
+    def paid_preregs(cls):
+        return cherrypy.session.setdefault('paid_preregs', [])
 
-    @staticmethod
-    def to_sessionized(m):
-        if isinstance(m, dict):
+    @classproperty
+    def unpaid_preregs(cls):
+        return cherrypy.session.setdefault('unpaid_preregs', OrderedDict())
+
+    @classmethod
+    def get_unpaid_promo_code_uses_count(cls, id, already_counted_attendee_ids=None):
+        attendees_with_promo_code = set()
+        if already_counted_attendee_ids:
+            attendees_with_promo_code.update(listify(already_counted_attendee_ids))
+
+        promo_code_count = 0
+
+        targets = [t for t in cls.unpaid_preregs.values() if '_model' in t]
+        for target in targets:
+            if target['_model'] == 'Attendee':
+                if target.get('id') not in attendees_with_promo_code \
+                        and target.get('promo_code') \
+                        and target['promo_code'].get('id') == id:
+                    attendees_with_promo_code.add(target.get('id'))
+                    promo_code_count += 1
+
+            elif target['_model'] == 'Group':
+                for attendee in target.get('attendees', []):
+                    if attendee.get('id') not in attendees_with_promo_code \
+                            and attendee.get('promo_code') \
+                            and attendee['promo_code'].get('id') == id:
+                        attendees_with_promo_code.add(attendee.get('id'))
+                        promo_code_count += 1
+
+            elif target['_model'] == 'PromoCode' and target.get('id') == id:
+                # Should never get here
+                promo_code_count += 1
+
+        return promo_code_count
+
+    @classmethod
+    def to_sessionized(cls, m):
+        if is_listy(m):
+            return [cls.to_sessionized(t) for t in m]
+        elif isinstance(m, dict):
             return m
         elif isinstance(m, sa.Attendee):
-            return m.to_dict()
+            return m.to_dict(sa.Attendee.to_dict_default_attrs + ['promo_code'])
         elif isinstance(m, sa.Group):
             return m.to_dict(sa.Group.to_dict_default_attrs + ['attendees'])
         else:
             raise AssertionError('{} is not an attendee or group'.format(m))
 
-    @staticmethod
-    def from_sessionized(d):
-        assert d['_model'] in {'Attendee', 'Group'}
-        if d['_model'] == 'Group':
-            d = dict(d, attendees=[sa.Attendee(**a) for a in d.get('attendees', [])])
-        return sa.Session.resolve_model(d['_model'])(**d)
+    @classmethod
+    def from_sessionized(cls, d):
+        if is_listy(d):
+            return [cls.from_sessionized(t) for t in d]
+        elif isinstance(d, dict):
+            assert d['_model'] in {'Attendee', 'Group'}
+            if d['_model'] == 'Group':
+                return cls.from_sessionized_group(d)
+            else:
+                return cls.from_sessionized_attendee(d)
+        else:
+            return d
 
-    @staticmethod
-    def get(payment_id):
+    @classmethod
+    def from_sessionized_group(cls, d):
+        d = dict(d, attendees=[cls.from_sessionized_attendee(a) for a in d.get('attendees', [])])
+        return sa.Group(**d)
+
+    @classmethod
+    def from_sessionized_attendee(cls, d):
+        if d.get('promo_code'):
+            d = dict(d, promo_code=sa.PromoCode(**d['promo_code']))
+        return sa.Attendee(**d)
+
+    @classmethod
+    def get(cls, payment_id):
         charge = cherrypy.session.pop(payment_id, None)
         if charge:
-            return Charge(**charge)
+            return cls(**charge)
         else:
             raise HTTPRedirect('../preregistration/credit_card_retry')
 
@@ -255,47 +336,92 @@ class Charge:
         return {
             'targets': self.targets,
             'amount': self.amount,
-            'description': self.description
+            'description': self.description,
+            'receipt_email': self.receipt_email
         }
 
     @property
-    def models(self):
-        return self._models_cached
+    def has_targets(self):
+        return not not self._targets
 
-    @property
+    @cached_property
     def total_cost(self):
         return 100 * sum(m.amount_unpaid for m in self.models)
 
-    @property
+    @cached_property
     def dollar_amount(self):
         return self.amount // 100
 
-    @property
+    @cached_property
+    def amount(self):
+        return self._amount or self.total_cost or 0
+
+    @cached_property
+    def description(self):
+        return self._description or self.names
+
+    @cached_property
+    def receipt_email(self):
+        return self.models[0].email if self.models and self.models[0].email else self._receipt_email
+
+    @cached_property
     def names(self):
         return ', '.join(getattr(m, 'name', getattr(m, 'full_name', None)) for m in self.models)
 
-    @property
+    @cached_property
+    def targets(self):
+        return self.to_sessionized(self._targets)
+
+    @cached_property
+    def models(self):
+        return self.from_sessionized(self._targets)
+
+    @cached_property
     def attendees(self):
         return [m for m in self.models if isinstance(m, sa.Attendee)]
 
-    @property
+    @cached_property
     def groups(self):
         return [m for m in self.models if isinstance(m, sa.Group)]
 
-    def charge_cc(self, token):
+    def charge_cc(self, session, token):
         try:
+            log.debug('PAYMENT: !!! attempting to charge stripeToken {} ${} for {}',
+                      token, self.amount, self.description)
+
             self.response = stripe.Charge.create(
                 card=token,
                 currency='usd',
                 amount=self.amount,
-                description=self.description
+                description=self.description,
+                receipt_email=self.receipt_email
             )
+
+            log.info('PAYMENT: !!! SUCCESS: charged stripeToken {} ${} for {}, responseID={}',
+                     token, self.amount, self.description, getattr(self.response, 'id', None))
+
         except stripe.CardError as e:
-            return 'Your card was declined with the following error from our processor: ' + str(e)
+            msg = 'Your card was declined with the following error from our processor: ' + str(e)
+            log.error('PAYMENT: !!! FAIL: {}', msg)
+            return msg
         except stripe.StripeError as e:
             error_txt = 'Got an error while calling charge_cc(self, token={!r})'.format(token)
             report_critical_exception(msg=error_txt, subject='ERROR: MAGFest Stripe invalid request error')
-            return 'An unexpected problem occured while processing your card: ' + str(e)
+            return 'An unexpected problem occurred while processing your card: ' + str(e)
+        else:
+            if self.models:
+                session.add(self.stripe_transaction_from_charge())
+
+    def stripe_transaction_from_charge(self, type=c.PAYMENT):
+        return sa.StripeTransaction(
+            stripe_id=self.response.id or None,
+            amount=self.amount,
+            desc=self.description,
+            type=type,
+            who=sa.AdminAccount.admin_name() or 'non-admin',
+            fk_id=self.models[0].id,
+            fk_model=self.models[0].__class__.__name__
+        )
 
 
 def report_critical_exception(msg, subject="Critical Error"):
@@ -332,14 +458,6 @@ def genpasswd():
             return ' '.join(random.choice(words) for i in range(4))
     except:
         return ''.join(chr(randrange(33, 127)) for i in range(8))
-
-
-def template_overrides(dirname):
-    """
-    Each event can have its own plugin and override our default templates with
-    its own by calling this method and passing its templates directory.
-    """
-    django.conf.settings.TEMPLATE_DIRS.insert(0, dirname)
 
 
 def static_overrides(dirname):
@@ -392,6 +510,42 @@ def convert_to_absolute_url(relative_uber_page_url):
 
 def get_real_badge_type(badge_type):
     return c.ATTENDEE_BADGE if badge_type in [c.PSEUDO_DEALER_BADGE, c.PSEUDO_GROUP_BADGE] else badge_type
+
+
+def add_opt(opts, other):
+    """
+    Add an option to an integer or list of integers, converting it to a comma-separated string.
+    This is for use with our MultiChoice columns.
+
+    Args:
+        opts: An integer or list of integers, such as when using attendee.ribbon_ints
+        other: An integer to add, such as c.VOLUNTEER_RIBBON
+
+    Returns: A comma-separated string representing all options in the list, with the new
+    option added.
+
+    """
+    other = listify(other) if other else []
+    opts.extend(other)
+    return ','.join(set(map(str, opts)))
+
+
+def remove_opt(opts, other):
+    """
+    Remove an option from an _ints property, converting it to a comma-separated string.
+    This is for use with our MultiChoice columns.
+
+    Args:
+        opts: An integer or list of integers, such as when using attendee.ribbon_ints
+        other: An integer to remove, such as c.VOLUNTEER_RIBBON
+
+    Returns: A comma-separated string representing all options in the list, with the option
+    removed.
+
+    """
+    other = listify(other) if other else []
+
+    return ','.join(map(str, set(opts).difference(other)))
 
 
 _when_dateformat = "%m/%d"
@@ -521,22 +675,3 @@ class request_cached_context:
     @staticmethod
     def _clear_cache():
         threadlocal.clear()
-
-
-def normalize_email(address):
-    """
-    For only @gmail addresses, periods need to be parsed
-    out because they simply don't matter.
-
-    For all other addresses, they are read normally.
-    """
-    address = address.lower()
-    if address.endswith("@gmail.com"):
-        address = address[:-10].replace(".", "") + "@gmail.com"
-    try:
-        validation_info = validate_email(address)
-        # get normalized result
-        address = validation_info["email"]
-    except EmailNotValidError:
-        pass  # ignore invalid emails
-    return address

@@ -14,6 +14,23 @@ def check_range(badge_num, badge_type):
                 return '{} badge numbers must fall within the range {} - {}'.format(dict(c.BADGE_OPTS)[badge_type], min_num, max_num)
 
 
+def is_badge_unchanged(attendee, old_badge_type, old_badge_num):
+    old_badge_num = int(old_badge_num or 0) or None
+    return old_badge_type == attendee.badge_type and \
+            (not attendee.badge_num or old_badge_num == attendee.badge_num)
+
+
+def reset_badge_if_unchanged(attendee, old_badge_type, old_badge_num):
+    """
+    The "change badge" page can pass an empty string for the badge number,
+    but if nothing actually changed about the attendee's badge, we need the
+    old number back!
+    """
+    if is_badge_unchanged(attendee, old_badge_type, old_badge_num):
+        attendee.badge_num = old_badge_num
+        return 'Attendee is already {} with badge {}'.format(c.BADGES[old_badge_type], old_badge_num)
+
+
 # TODO: returning (result, error) is not a convention we're using anywhere else,
 #       so maybe change this to be more idiomatic if convenient, but not a big deal
 def get_badge_type(badge_num):
@@ -67,8 +84,8 @@ def check_placeholders():
     if c.PRE_CON and c.CHECK_PLACEHOLDERS and (c.DEV_BOX or c.SEND_EMAILS):
         emails = [
             ['Staff', c.STAFF_EMAIL, Attendee.staffing == True],
-            ['Panelist', c.PANELS_EMAIL, or_(Attendee.badge_type == c.GUEST_BADGE, Attendee.ribbon == c.PANELIST_RIBBON)],
-            ['Attendee', c.REGDESK_EMAIL, not_(or_(Attendee.staffing == True, Attendee.badge_type == c.GUEST_BADGE, Attendee.ribbon == c.PANELIST_RIBBON))]
+            ['Panelist', c.PANELS_EMAIL, or_(Attendee.badge_type == c.GUEST_BADGE, Attendee.ribbon.contains(c.PANELIST_RIBBON))],
+            ['Attendee', c.REGDESK_EMAIL, not_(or_(Attendee.staffing == True, Attendee.badge_type == c.GUEST_BADGE, Attendee.ribbon.contains(c.PANELIST_RIBBON)))]
         ]
         with Session() as session:
             for badge_type, dest, per_email_filter in emails:

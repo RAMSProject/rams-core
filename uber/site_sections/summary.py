@@ -1,3 +1,4 @@
+from dateutil.relativedelta import relativedelta
 from uber.common import *
 
 
@@ -10,14 +11,15 @@ def generate_staff_badges(start_badge, end_badge, out, session):
     uber.reports.PrintedBadgeReport(
         badge_type=c.STAFF_BADGE,
         range=badge_range,
-        badge_type_name='Staff') \
-        .run(out, session)
+        badge_type_name='Staff').run(out, session)
 
 
 @all_renderable(c.STATS)
 class Root:
     def index(self, session):
         counts = defaultdict(OrderedDict)
+        counts['donation_tiers'] = OrderedDict([(k, 0) for k in sorted(c.DONATION_TIERS.keys()) if k > 0])
+
         counts.update({
             'groups': {'paid': 0, 'free': 0},
             'noshows': {'paid': 0, 'free': 0},
@@ -42,7 +44,8 @@ class Root:
         for a in session.query(Attendee).options(joinedload(Attendee.group)):
             counts['paid'][a.paid_label] += 1
             counts['ages'][a.age_group_label] += 1
-            counts['ribbons'][a.ribbon_label] += 1
+            for val in a.ribbon_ints:
+                counts['ribbons'][c.RIBBONS[val]] += 1
             counts['badges'][a.badge_type_label] += 1
             counts['statuses'][a.badge_status_label] += 1
             counts['checked_in']['yes' if a.checked_in else 'no'] += 1
@@ -50,6 +53,12 @@ class Root:
                 counts['interests'][c.INTERESTS[val]] += 1
             if a.paid == c.PAID_BY_GROUP and a.group:
                 counts['groups']['paid' if a.group.amount_paid else 'free'] += 1
+
+            donation_amounts = list(counts['donation_tiers'].keys())
+            for index, amount in enumerate(donation_amounts):
+                next_amount = donation_amounts[index + 1] if index + 1 < len(donation_amounts) else six.MAXSIZE
+                if a.total_donation >= amount and a.total_donation < next_amount:
+                    counts['donation_tiers'][amount] = counts['donation_tiers'][amount] + 1
             if not a.checked_in:
                 key = 'paid' if a.paid == c.HAS_PAID or a.paid == c.PAID_BY_GROUP and a.group and a.group.amount_paid else 'free'
                 counts['noshows'][key] += 1
@@ -145,7 +154,7 @@ class Root:
     @csv_file
     def dept_head_contact_info(self, out, session):
         out.writerow(["Full Name", "Email", "Phone", "Department(s)"])
-        for a in session.query(Attendee).filter_by(ribbon=c.DEPT_HEAD_RIBBON).order_by('last_name'):
+        for a in session.query(Attendee).filter(Attendee.ribbon.contains(c.DEPT_HEAD_RIBBON)).order_by('last_name'):
             for label in a.assigned_depts_labels:
                 out.writerow([a.full_name, a.email, a.cellphone, label])
 
@@ -168,7 +177,7 @@ class Root:
                     group.name,
                     group.description,
                     group.website,
-                    group.address,
+                    group.address1,
                     group.tables,
                     group.amount_paid,
                     group.cost,
@@ -189,7 +198,10 @@ class Root:
 
     @csv_file
     def printed_badges_minor(self, out, session):
-        uber.reports.PrintedBadgeReport(badge_type=c.CHILD_BADGE, badge_type_name='Minor').run(out, session)
+        try:
+            uber.reports.PrintedBadgeReport(badge_type=c.CHILD_BADGE, badge_type_name='Minor').run(out, session)
+        except AttributeError:
+            pass
 
     @csv_file
     def printed_badges_staff(self, out, session):
@@ -226,7 +238,7 @@ class Root:
             badge_type_override='supporter')
 
     """
-    Enumerate individual CSVs here that will be intergrated into the .zip which will contain all the
+    Enumerate individual CSVs here that will be integrated into the .zip which will contain all the
     badge types.  Downstream plugins can override which items are in this list.
     """
     badge_zipfile_contents = [
@@ -259,7 +271,7 @@ class Root:
             for a in session.staffers().all() + session.query(Attendee).filter_by(badge_type=c.GUEST_BADGE).all()
             if not a.is_unassigned
                 and (a.badge_type in (c.STAFF_BADGE, c.GUEST_BADGE)
-                  or a.ribbon == c.VOLUNTEER_RIBBON and a.weighted_hours >= 12)
+                  or c.VOLUNTEER_RIBBON in a.ribbon_ints and a.weighted_hours >= 12)
         }
         return render('summary/food_eligible.xml', {'attendees': eligible})
 
@@ -293,11 +305,14 @@ class Root:
 
             counts['swag'][label(shirt_label)] += attendee.num_swag_shirts_owed
 
+        categories = []
+        if c.SHIRTS_PER_STAFFER > 0:
+            categories.append(('Staff Uniform Shirts', sort(counts['staff'])))
+
+        categories.append(('Swag Shirts', sort(counts['swag'])))
+
         return {
-            'categories': [
-                ('Staff Uniform Shirts', sort(counts['staff'])),
-                ('Swag Shirts', sort(counts['swag'])),
-            ]
+            'categories': categories,
         }
 
     def shirt_counts(self, session):
@@ -315,19 +330,24 @@ class Root:
             if attendee.paid_for_a_swag_shirt:
                 counts['paid_swag_shirts'][label(shirt_label)][status(attendee.got_merch)] += 1
                 counts['all_swag_shirts'][label(shirt_label)][status(attendee.got_merch)] += 1
-                sales_by_week[(datetime.now(UTC) - attendee.registered).days // 7] += 1
+                sales_by_week[(min(datetime.now(UTC), c.ESCHATON) - attendee.registered).days // 7] += 1
             if attendee.gets_staff_shirt:
                 counts['staff_shirts'][label(shirt_label)][status(attendee.got_merch)] += c.SHIRTS_PER_STAFFER
         for week in range(48, -1, -1):
             sales_by_week[week] += sales_by_week[week + 1]
+
+        categories = [
+            ('Free Swag Shirts', sort(counts['free_swag_shirts'])),
+            ('Paid Swag Shirts', sort(counts['paid_swag_shirts'])),
+            ('All Swag Shirts', sort(counts['all_swag_shirts'])),
+        ]
+
+        if c.SHIRTS_PER_STAFFER > 0:
+            categories.append(('Staff Shirts', sort(counts['staff_shirts'])))
+
         return {
             'sales_by_week': sales_by_week,
-            'categories': [
-                ('Free Swag Shirts', sort(counts['free_swag_shirts'])),
-                ('Paid Swag Shirts', sort(counts['paid_swag_shirts'])),
-                ('All Swag Shirts', sort(counts['all_swag_shirts'])),
-                ('Staff Shirts', sort(counts['staff_shirts']))
-            ]
+            'categories': categories,
         }
 
     def extra_merch(self, session):
@@ -356,10 +376,10 @@ class Root:
     def consecutive_threshold(self, session):
         def exceeds_threshold(start_time, attendee):
             time_slice = [start_time + timedelta(hours=i) for i in range(18)]
-            return len([h for h in attendee.hours if h in time_slice]) > 12
+            return len([h for h in attendee.hours if h in time_slice]) >= 12
         flagged = []
         for attendee in session.staffers():
-            if attendee.staffing and attendee.weighted_hours > 12:
+            if attendee.staffing and attendee.weighted_hours >= 12:
                 for start_time, desc in c.START_TIME_OPTS[::6]:
                     if exceeds_threshold(start_time, attendee):
                         flagged.append(attendee)
@@ -392,3 +412,89 @@ class Root:
                                                           and a.weighted_hours >= c.HOURS_FOR_REFUND]
             )]
         }
+
+    @csv_file
+    @site_mappable
+    def attendee_birthday_calendar(
+            self,
+            out,
+            session,
+            year=datetime.now(UTC).year):
+
+        out.writerow([
+            'Subject', 'Start Date', 'Start Time', 'End Date', 'End Time',
+            'All Day Event', 'Description', 'Location', 'Private'])
+
+        query = session.query(Attendee).filter(Attendee.birthdate != None)
+        for person in query.all():
+            subject = "%s's Birthday" % person.full_name
+            delta_years = year - person.birthdate.year
+            start_date = person.birthdate + relativedelta(years=delta_years)
+            end_date = start_date
+            all_day = True
+            private = False
+            out.writerow([
+                subject, start_date, '', end_date, '', all_day, '', '', private
+            ])
+
+    @csv_file
+    @site_mappable
+    def event_birthday_calendar(self, out, session):
+        out.writerow([
+            'Subject', 'Start Date', 'Start Time', 'End Date', 'End Time',
+            'All Day Event', 'Description', 'Location', 'Private'])
+
+        is_multiyear = c.EPOCH.year != c.ESCHATON.year
+        is_multimonth = c.EPOCH.month != c.ESCHATON.month
+        query = session.query(Attendee).filter(Attendee.birthdate != None)
+        birth_month = extract('month', Attendee.birthdate)
+        birth_day = extract('day', Attendee.birthdate)
+        if is_multiyear:
+            # The event starts in one year and ends in another
+            query = query.filter(or_(
+                or_(
+                    birth_month > c.EPOCH.month,
+                    birth_month < c.ESCHATON.month),
+                and_(
+                    birth_month == c.EPOCH.month,
+                    birth_day >= c.EPOCH.day),
+                and_(
+                    birth_month == c.ESCHATON.month,
+                    birth_day <= c.ESCHATON.day)))
+        elif is_multimonth:
+            # The event starts in one month and ends in another
+            query = query.filter(or_(
+                and_(
+                    birth_month > c.EPOCH.month,
+                    birth_month < c.ESCHATON.month),
+                and_(
+                    birth_month == c.EPOCH.month,
+                    birth_day >= c.EPOCH.day),
+                and_(
+                    birth_month == c.ESCHATON.month,
+                    birth_day <= c.ESCHATON.day)))
+        else:
+            # The event happens entirely within a single month
+            query = query.filter(and_(
+                birth_month == c.EPOCH.month,
+                birth_day >= c.EPOCH.day,
+                birth_day <= c.ESCHATON.day))
+
+        for person in query.all():
+            subject = "%s's Birthday" % person.full_name
+
+            year_of_birthday = c.ESCHATON.year
+            if is_multiyear:
+                birth_month = person.birthdate.month
+                birth_day = person.birthdate.day
+                if birth_month >= c.EPOCH.month and birth_day >= c.EPOCH.day:
+                    year_of_birthday = c.EPOCH.year
+
+            delta_years = year_of_birthday - person.birthdate.year
+            start_date = person.birthdate + relativedelta(years=delta_years)
+            end_date = start_date
+            all_day = True
+            private = False
+            out.writerow([
+                subject, start_date, '', end_date, '', all_day, '', '', private
+            ])
