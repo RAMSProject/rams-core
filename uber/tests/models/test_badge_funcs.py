@@ -203,15 +203,25 @@ class TestAutoBadgeNum:
     def test_dupe_nums(self, session, monkeypatch):
         session.add(Attendee(badge_type=c.ATTENDEE_BADGE, checked_in=datetime.now(UTC), first_name="3002", paid=c.HAS_PAID, badge_num=3001))
         session.add(Attendee(badge_type=c.ATTENDEE_BADGE, checked_in=datetime.now(UTC), first_name="3000", paid=c.HAS_PAID, badge_num=3001))
+
         # Skip the badge adjustments here, which prevent us from setting duplicate numbers
-        monkeypatch.setattr(Attendee, '_badge_adjustments', 0)
+        @presave_adjustment
+        def _empty_adjustment(self):
+            pass
+
+        monkeypatch.setattr(Attendee, '_badge_adjustments', _empty_adjustment)
         session.commit()
         assert 3002 == session.auto_badge_num(c.ATTENDEE_BADGE)
 
     def test_diff_type_with_num_in_range(self, session, monkeypatch):
         session.add(Attendee(badge_type=c.SUPPORTER_BADGE, badge_num=6))
+
         # We want to force the badge number we set even though it's incorrect
-        monkeypatch.setattr(Attendee, '_badge_adjustments', 0)
+        @presave_adjustment
+        def _empty_adjustment(self):
+            pass
+
+        monkeypatch.setattr(Attendee, '_badge_adjustments', _empty_adjustment)
         session.commit()
         assert 7 == session.auto_badge_num(c.STAFF_BADGE)
 
@@ -440,7 +450,7 @@ class TestBadgeValidations:
         session.regular_attendee.badge_type = session.regular_attendee.badge_type
         session.regular_attendee.badge_type = c.STAFF_BADGE
         session.regular_attendee.badge_num = None
-        assert 'Custom badges have already been ordered' == check(session.regular_attendee)
+        assert 'Custom badges have already been ordered so you cannot use this badge type' == check(session.regular_attendee)
 
     def test_out_of_badge_type(self, session, monkeypatch, before_printed_badge_deadline):
         monkeypatch.setitem(c.BADGE_RANGES, c.STAFF_BADGE, [1, 5])

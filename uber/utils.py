@@ -77,16 +77,26 @@ def localize_datetime(dt):
     return dt.replace(tzinfo=UTC).astimezone(c.EVENT_TIMEZONE)
 
 
-def comma_and(xs):
+@JinjaEnv.jinja_filter
+def comma_and(xs, conjunction='and'):
     """
     Accepts a list of strings and separates them with commas as grammatically
-    appropriate with an "and" before the final entry.  For example:
-        ['foo']               => 'foo'
-        ['foo', 'bar']        => 'foo and bar'
-        ['foo', 'bar', 'baz'] => 'foo, bar, and baz'
+    appropriate with a conjunction before the final entry. For example::
+
+        >>> comma_and(['foo'])
+        'foo'
+        >>> comma_and(['foo', 'bar'])
+        'foo and bar'
+        >>> comma_and(['foo', 'bar', 'baz'])
+        'foo, bar, and baz'
+        >>> comma_and(['foo', 'bar', 'baz'], 'or')
+        'foo, bar, or baz'
+        >>> comma_and(['foo', 'bar', 'baz'], 'but never')
+        'foo, bar, but never baz'
     """
     if len(xs) > 1:
-        xs[-1] = 'and ' + xs[-1]
+        xs = list(xs)
+        xs[-1] = conjunction + ' ' + xs[-1]
     return (', ' if len(xs) > 2 else ' ').join(xs)
 
 
@@ -177,18 +187,19 @@ class DeptChecklistConf(Registry):
         assert re.match('^[a-z0-9_]+$', slug), 'Dept Head checklist item sections must have separated_by_underscore names'
         self.slug, self.description = slug, description
         self.name = name or slug.replace('_', ' ').title()
-        self._path = path or '/dept_checklist/form?slug={slug}'
+        self._path = path or '/dept_checklist/form?slug={slug}&department_id={department_id}'
         self.email_post_con = email_post_con
         self.deadline = c.EVENT_TIMEZONE.localize(datetime.strptime(deadline, '%Y-%m-%d')).replace(hour=23, minute=59)
 
-    def path(self, attendee):
-        dept = attendee and attendee.assigned_depts and attendee.assigned_depts_ints[0]
-        return self._path.format(slug=self.slug, department=dept)
-
-    def completed(self, attendee):
-        matches = [item for item in attendee.dept_checklist_items if self.slug == item.slug]
-        return matches[0] if matches else None
-
+    def path(self, department_id):
+        from uber.models.department import Department
+        department_id = Department.to_id(department_id)
+        for arg in ('department_id', 'department', 'location'):
+            try:
+                return self._path.format(slug=self.slug, **{arg: department_id})
+            except KeyError:
+                pass
+        raise KeyError('department_id')
 
 for _slug, _conf in sorted(c.DEPT_HEAD_CHECKLIST.items(), key=lambda tup: tup[1]['deadline']):
     DeptChecklistConf.register(_slug, _conf)
@@ -294,9 +305,13 @@ class Charge:
         elif isinstance(m, dict):
             return m
         elif isinstance(m, sa.Attendee):
-            return m.to_dict(sa.Attendee.to_dict_default_attrs + ['promo_code'])
+            return m.to_dict(sa.Attendee.to_dict_default_attrs
+                + ['promo_code']
+                + list(sa.Attendee.extra_apply_attrs_restricted))
         elif isinstance(m, sa.Group):
-            return m.to_dict(sa.Group.to_dict_default_attrs + ['attendees'])
+            return m.to_dict(sa.Group.to_dict_default_attrs
+                + ['attendees']
+                + list(sa.Group.extra_apply_attrs_restricted))
         else:
             raise AssertionError('{} is not an attendee or group'.format(m))
 
@@ -546,6 +561,28 @@ def remove_opt(opts, other):
     other = listify(other) if other else []
 
     return ','.join(map(str, set(opts).difference(other)))
+
+
+def get_age_from_birthday(birthdate, today=None):
+    """
+    Determines a person's age in the US. DO NOT use this to find other timespans, like the duration of an event.
+    This function does not calculate a fully accurate timespan between two datetimes.
+    This function assumes that a person's age begins at zero, and increments when `today.day == birthdate.day`.
+    This will not be accurate for cultures which calculate age differently than the US, such as Korea.
+
+    Args:
+        birthdate: A date, should be earlier than the second parameter
+        today:  Optional, age will be found as of this date
+
+    Returns: An integer indicating the age.
+
+    """
+
+    if today == None:
+        today = date.today()
+
+    # Hint: int(True) == 1 and int(False) == 0
+    return today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
 
 
 _when_dateformat = "%m/%d"
