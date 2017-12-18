@@ -13,6 +13,7 @@ on success and a string error message on validation failure.
 """
 from uber.common import *
 from email_validator import validate_email, EmailNotValidError
+import phonenumbers
 
 
 AdminAccount.required = [('attendee', 'Attendee'), ('hashed', 'Password')]
@@ -32,6 +33,39 @@ def has_email_address(account):
         with Session() as session:
             if session.query(Attendee).filter_by(id=account.attendee_id).first().email == '':
                 return "Attendee doesn't have a valid email set"
+
+
+@validation.AdminAccount
+def admin_has_required_access(account):
+    new_access = set(int(s) for s in account.access.split(',') if s)
+    old_access = set() if account.is_new else \
+        set(int(s) for s in account.orig_value_of('access').split(',') if s)
+    access_changes = new_access.symmetric_difference(old_access)
+    if any(c.REQUIRED_ACCESS[a] for a in access_changes):
+        with Session() as session:
+            admin_account = session.current_admin_account()
+            admin_access = set(admin_account.access_ints)
+            for access_change in access_changes:
+                required_access = c.REQUIRED_ACCESS[access_change]
+                if all(a not in admin_access for a in required_access):
+                    return 'You do not have permission to change that access setting'
+
+
+ApiToken.required = [('name', 'Name'), ('description', 'Intended Usage'), ('access', 'Access Controls')]
+
+
+@validation.ApiToken
+def admin_has_required_api_access(api_token):
+    admin_account_id = cherrypy.session['account_id']
+    if api_token.is_new and admin_account_id != api_token.admin_account_id:
+            return 'You may not create an API token for another user'
+
+    with Session() as session:
+        admin_account = session.current_admin_account()
+        token_access = set(api_token.access_ints)
+        admin_access = set(admin_account.access_ints)
+        if not token_access.issubset(admin_access):
+            return 'You do not have permission to create a token with that access'
 
 
 Group.required = [('name', 'Group Name')]
@@ -118,8 +152,22 @@ def group_money(group):
 
 
 def _invalid_phone_number(s):
-    if not s.startswith('+'):
-        return len(re.findall(r'\d', s)) != 10 or re.search(c.SAME_NUMBER_REPEATED, re.sub(r'[^0-9]', '', s))
+    try:
+        # parse input as a US number, unless a leading + is provided,
+        # in which case the input will be validated according to the country code
+        parsed = phonenumbers.parse(s, 'US')
+    except phonenumbers.phonenumberutil.NumberParseException:
+        # could not be parsed due to unexpected characters
+        return True
+
+    if not phonenumbers.is_possible_number(parsed):
+        # could not be a phone number due to length, invalid characters, etc
+        return True
+    elif parsed.country_code == 1 and phonenumbers.length_of_national_destination_code(parsed) == 0:
+        # US number does not contain area code
+        return True
+
+    return False
 
 
 def _invalid_zip_code(s):
@@ -271,10 +319,8 @@ def emergency_contact(attendee):
 @ignore_unassigned_and_placeholders
 def cellphone(attendee):
     if attendee.cellphone and _invalid_phone_number(attendee.cellphone):
-        if c.COLLECT_FULL_ADDRESS:
-            return 'Enter a 10-digit US phone number or include a country code (e.g. +44) for your phone number.'
-        else:
-            return 'Your phone number was not a valid 10-digit phone number'
+        # phone number was inputted incorrectly
+        return 'Your phone number was not a valid 10-digit US phone number. Please include a country code (e.g. +44) for international numbers.'
 
     if not attendee.no_cellphone and attendee.staffing and not attendee.cellphone:
         return "Phone number is required for volunteers (unless you don't own a cellphone)"
@@ -294,30 +340,11 @@ def emergency_contact_not_cellphone(attendee):
 
 
 @validation.Attendee
-def printed_badge_deadline(attendee):
-    if attendee.is_new and attendee.has_personalized_badge and c.AFTER_PRINTED_BADGE_DEADLINE:
-        return 'Custom badges have already been ordered so you cannot create new {} badges'.format(attendee.badge_type_label)
-
-
-@validation.Attendee
 def printed_badge_change(attendee):
-    badge_name_changes_allowed = True
-
-    # this is getting kinda messy and we probably need to rework the entire concept of "printed badge deadline".
-    # right now we want to:
-    # 1) allow supporters to change their badge names until c.SUPPORTER_DEADLINE
-    # 2) allow staff to change their badge names until c.PRINTED_BADGE_DEADLINE
-    #
-    # this implies that we actually have two different printed badge deadlines: 1 for staff, 1 for supporters.
-    # we might just want to make that explicit.
-    if attendee.badge_type == c.STAFF_BADGE and c.AFTER_PRINTED_BADGE_DEADLINE:
-        badge_name_changes_allowed = False
-    elif attendee.amount_extra >= c.SUPPORTER_LEVEL and c.AFTER_SUPPORTER_DEADLINE:
-        badge_name_changes_allowed = False
-
-    if not badge_name_changes_allowed:
-        if attendee.badge_printed_name != attendee.orig_value_of('badge_printed_name'):
-            return 'Custom badges have already been ordered, so you cannot change the printed name of this Attendee'
+    if attendee.badge_printed_name != attendee.orig_value_of('badge_printed_name') and not AdminAccount.admin_name() and \
+                    localized_now() > c.get_printed_badge_deadline_by_type(attendee.badge_type):
+            return '{} badges have already been ordered, so you cannot change the badge printed name.'\
+                .format(attendee.badge_type_label if attendee.badge_type in c.PREASSIGNED_BADGE_TYPES else "Supporter")
 
 
 @validation.Attendee
@@ -403,7 +430,9 @@ def invalid_badge_num(attendee):
 def no_more_custom_badges(attendee):
     if (attendee.badge_type != attendee.orig_value_of('badge_type') or attendee.is_new)\
             and attendee.has_personalized_badge and c.AFTER_PRINTED_BADGE_DEADLINE:
-        return 'Custom badges have already been ordered'
+        with Session() as session:
+            if all(not session.admin_attendee().is_dept_head_of(d) for d in [c.REGDESK, c.STOPS]):
+                return 'Custom badges have already been ordered so you cannot use this badge type'
 
 
 @validation.Attendee
@@ -418,7 +447,7 @@ def out_of_badge_type(attendee):
 
 @validation.Attendee
 def invalid_badge_name(attendee):
-    if attendee.badge_printed_name and c.BEFORE_PRINTED_BADGE_DEADLINE \
+    if attendee.badge_printed_name and localized_now() <= c.get_printed_badge_deadline_by_type(attendee.badge_type) \
             and re.search(c.INVALID_BADGE_PRINTED_CHARS, attendee.badge_printed_name):
         return 'Your printed badge name has invalid characters. Please use only printable ASCII characters.'
 
@@ -456,6 +485,20 @@ def time_conflicts(job):
         for shift in job.shifts:
             if job.hours.intersection(shift.attendee.hours - original_hours):
                 return 'You cannot change this job to this time, because {} is already working a shift then'.format(shift.attendee.full_name)
+
+
+Department.required = [('name', 'Name'), ('description', 'Description')]
+DeptRole.required = [('name', 'Name')]
+
+
+@validation.DeptChecklistItem
+def is_checklist_admin(dept_checklist_item):
+    with Session() as session:
+        attendee = session.admin_attendee()
+        department_id = dept_checklist_item.department_id \
+            or dept_checklist_item.department.id
+        if not attendee.can_admin_checklist_for(department_id):
+            return 'Only checklist admins can complete checklist items'
 
 
 @validation.OldMPointExchange

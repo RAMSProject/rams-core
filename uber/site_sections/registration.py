@@ -278,6 +278,7 @@ class Root:
                 if replacement_attendee.group and replacement_attendee.group.is_dealer:
                     replacement_attendee.ribbon = add_opt(replacement_attendee.ribbon_ints, c.DEALER_RIBBON)
                 session.add(replacement_attendee)
+                attendee._skip_badge_shift_on_delete = True
                 session.delete_from_group(attendee, attendee.group)
                 message = 'Attendee deleted, but this badge is still available to be assigned to someone else in the same group'
         else:
@@ -774,16 +775,18 @@ class Root:
                                                        Attendee.registered > start, Attendee.registered <= end).all()
             params['sales'] = sales
             params['attendees'] = attendees
-            params['total_cash'] = sum(a.amount_paid for a in attendees if a.payment_method == CASH) \
-                                 + sum(s.cash for s in sales if s.payment_method == CASH)
+            params['total_cash'] = sum(a.amount_paid for a in attendees if a.payment_method == c.CASH) \
+                                 + sum(s.cash for s in sales if s.payment_method == c.CASH)
             params['total_credit'] = sum(a.amount_paid for a in attendees if a.payment_method in [c.STRIPE, c.SQUARE, c.MANUAL]) \
                                    + sum(s.cash for s in sales if s.payment_method == c.CREDIT)
         else:
             params['endday'] = localized_now().strftime('%Y-%m-%d')
             params['endhour'] = localized_now().strftime('%H')
             params['endminute'] = localized_now().strftime('%M')
-
-        stations = sorted(filter(bool, Attendee.objects.values_list('reg_station', flat=True).distinct()))
+        # list all reg stations associated with attendees and sales
+        stations_attendees = session.query(Attendee.reg_station).filter(Attendee.reg_station != None, Attendee.reg_station > 0)
+        stations_sales = session.query(Sale.reg_station).filter(Sale.reg_station != None, Sale.reg_station > 0)
+        stations = [r for (r,) in stations_attendees.union(stations_sales).distinct().order_by(Attendee.reg_station)]
         params['reg_stations'] = stations
         params.setdefault('reg_station', stations[0] if stations else 0)
         return params
@@ -798,20 +801,16 @@ class Root:
 
     def shifts(self, session, id, shift_id='', message=''):
         attendee = session.attendee(id, allow_invalid=True)
+        attrs = Shift.to_dict_default_attrs + ['worked_label']
         return {
-            'message':  message,
+            'message': message,
             'shift_id': shift_id,
             'attendee': attendee,
-            'shifts':   Shift.dump(attendee.shifts),
-            'jobs':     [(job.id, '({}) [{}] {}'.format(job.timespan(), job.location_label, job.name))
-                         for job in session.query(Job)
-                                           .outerjoin(Job.shifts)
-                                           .filter(Job.location.in_(attendee.assigned_depts_ints),
-                                                   or_(Job.restricted == False, Job.location.in_(attendee.trusted_depts_ints)))
-                                           .group_by(Job.id)
-                                           .having(func.count(Shift.id) < Job.slots)
-                                           .order_by(Job.start_time, Job.location)
-                         if job.start_time + timedelta(hours=job.duration + 2) > localized_now()]
+            'shifts': {s.id: s.to_dict(attrs) for s in attendee.shifts},
+            'jobs': [
+                (job.id, '({}) [{}] {}'.format(job.timespan(), job.department_name, job.name))
+                for job in attendee.available_jobs
+                if job.start_time + timedelta(hours=job.duration + 2) > localized_now()]
         }
 
     @csrf_protected
@@ -935,17 +934,21 @@ class Root:
 
         return {'message': message}
 
-    def placeholders(self, session, department=''):
+    @department_id_adapter
+    def placeholders(self, session, department_id=None):
+        dept_filter = [] if not department_id \
+            else [Attendee.dept_memberships.any(department_id=department_id)]
+        placeholders = session.query(Attendee).filter(
+            Attendee.placeholder == True,
+            Attendee.staffing == True,
+            Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]),
+            *dept_filter).order_by(Attendee.full_name).all()
+
         return {
-            'department': department,
-            'dept_name': c.JOB_LOCATIONS[int(department)] if department else 'All',
-            'checklist': session.checklist_status('placeholders', department),
-            'placeholders': [a for a in session.query(Attendee)
-                                               .filter(Attendee.placeholder == True,
-                                                       Attendee.staffing == True,
-                                                       Attendee.badge_status.in_([c.NEW_STATUS, c.COMPLETED_STATUS]),
-                                                       Attendee.assigned_depts.contains(department))
-                                               .order_by(Attendee.full_name).all()]
+            'department_id': department_id,
+            'dept_name': session.query(Department).get(department_id).name if department_id else 'All',
+            'checklist': session.checklist_status('placeholders', department_id),
+            'placeholders': placeholders
         }
 
     def inactive(self, session):

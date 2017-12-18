@@ -11,6 +11,14 @@ label.error {
     margin-bottom: 0px;
 }
 
+#mainContainer > .navbar {
+    margin: 0 -15px 15px -15px;
+}
+
+#mainContainer .navbar .navbar-nav > li > a {
+    padding: 15px 12px;
+}
+
 #mainContainer {
     padding-bottom: 30px;
 }
@@ -44,6 +52,28 @@ label.error {
 .modal-footer {
     border-top: none;
 }
+
+.btn-plain {
+    text-shadow: 0 1px 0 #e0e0e0;
+    background-color: #c0c0c0;
+    border-color: #a0a0a0;
+    color: #333;
+}
+.btn-plain:hover,
+.btn-plain:focus {
+    background-color: #d0d0d0;
+}
+.btn-plain:active,
+.btn-plain.active {
+    background-color: #b8b8b8;
+}
+.btn-plain:disabled,
+.btn-plain[disabled] {
+    color: #808080;
+    background-color: #e0e0e0;
+    border-color: #e0e0e0;
+}
+
 
 h1 small, h2 small, h3 small, h4 small, h5 small, h6 small {
     white-space: nowrap;
@@ -128,4 +158,59 @@ span.jq-dte {
     content: none;
     padding-left: 0;
     padding-right: 0;
+}
+
+/* imported from styles.css */
+
+table.navmenu {
+    border-spacing: 5px;
+    border-collapse: collapse;
+    text-align:      center;
+    margin-top:      10px;
+    margin-bottom:   10px;
+    width:          100%;
+
+}
+table.navmenu td {
+    border: 2px solid gray;
+    padding: 5px;
+}
+
+table.list {
+    width:           100%;
+    text-align:      center;
+    border-collapse: collapse;
+}
+table.list td {
+    border:  1px solid black;
+    padding: 5px;
+}
+table.list tr.header {
+    background:     #99CCFF;
+    font-weight:    bold;
+    vertical-align: bottom;
+}
+table.list tr.header a,
+table.list tr.header a:hover,
+table.list tr.header a:visited {
+    color:           black;
+    text-decoration: none;
+}
+table.list table td {
+    border:  0;
+    padding: 0;
+}
+
+.pad-top-10 li {
+    padding-top: 10px;
+}
+
+.center {
+    text-align: center;
+}
+
+ul.ui-autocomplete {
+    max-height: 250px;
+    overflow-x: hidden;
+    overflow-y: auto;
 }
